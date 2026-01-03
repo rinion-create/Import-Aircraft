@@ -97,7 +97,7 @@ MASTER_REGEX_PATTERNS = [
 ]
 
 # Repo-bundled Master (Option B)
-EPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "260101_Aircraft_Master.xlsx")
+REPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "260101_Aircraft_Master.xlsx")
 
 MANUFACTURER_COL_CANDIDATES = ["manufacturer", "aircraft manufacturer", "mfr", "oem", "maker"]
 TYPE_COL_CANDIDATES         = ["type", "aircraft type", "model", "family", "series", "aircraft model"]
