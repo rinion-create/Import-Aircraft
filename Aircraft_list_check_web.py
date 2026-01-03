@@ -11,7 +11,7 @@ Option B: Bundle a read-only Master with the repo for Streamlit Cloud.
 
 Behavior:
 - Upload Master: always honored (local or cloud).
-- Cloud mode (detected): fall back to repo-bundled Master at ./data/260101_Aircraft_Master.xlsx.
+- Cloud mode (detected): fall back to repo-bundled Master at ./260101_Aircraft_Master.xlsx.
 - Local mode: try fixed OneDrive paths, then auto-search; fallback to upload.
 - Outputs keep original import filename with suffixes:
     * <stem>_import_ready.xlsx
@@ -97,7 +97,7 @@ MASTER_REGEX_PATTERNS = [
 ]
 
 # Repo-bundled Master (Option B)
-REPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "data", "260101_Aircraft_Master.xlsx")
+EPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "260101_Aircraft_Master.xlsx")
 
 MANUFACTURER_COL_CANDIDATES = ["manufacturer", "aircraft manufacturer", "mfr", "oem", "maker"]
 TYPE_COL_CANDIDATES         = ["type", "aircraft type", "model", "family", "series", "aircraft model"]
@@ -771,7 +771,7 @@ def running_in_cloud() -> bool:
 
 st.title("🛫 SafetyManager365")
 st.subheader("Aircraft Import Validator & Suggester")
-st.caption("Ruben Inion v0.3 — Original-name outputs, OneDrive save (local), Repo-bundled Master for Cloud.")
+st.caption("Ruben Inion v0.3")
 
 with st.sidebar:
     st.header("Settings")
