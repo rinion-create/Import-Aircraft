@@ -7,25 +7,16 @@ Streamlit App — Aircraft import validator & suggester
 (CASE-SENSITIVE, hyphen-preserving, ICAO alias-aware, avoids 'N/A' code suggestions,
  original-type-first, base-family preference, canonical preference, preserves original import structure)
 
-Features:
-- Upload Import Excel (.xlsx).
-- Master Excel:
-    - Auto-resolve from OneDrive by scanning common fixed paths, then
-      FALL BACK to an automatic recursive search across your OneDrive (configurable depth).
-    - OR upload a Master file to override auto-resolve.
-- Validates Manufacturer, Type, Engine, and their combination (strict, case-sensitive).
-- Suggests corrections prioritizing:
-    1) Exact combo
-    2) ICAO/IATA code-derived exact combo (alias-aware, skips 'N/A' codes)
-    3) Original-type-first within family
-    4) Base family type (numeric-only canonical types, e.g., '737-800')
-    5) Canonical family choice (closest to original, penalizing variant flags: W, ER, BCF, etc.)
-    6) Global fuzzy fallback, excluding Types whose ICAO is 'N/A'
-- Outputs:
-    - Validation report (Summary + Validation) with diagnostic columns HIDDEN
-    - Suggested Import workbook preserving original columns & order
-      (only Manufacturer/Type/Engine and MasterID—if present—are updated)
-    - Easy download buttons and optional OneDrive save
+Option B: Bundle a read-only Master with the repo for Streamlit Cloud.
+
+Behavior:
+- Upload Master: always honored (local or cloud).
+- Cloud mode (detected): fall back to repo-bundled Master at ./data/260101_Aircraft_Master.xlsx.
+- Local mode: try fixed OneDrive paths, then auto-search; fallback to upload.
+- Outputs keep original import filename with suffixes:
+    * <stem>_import_ready.xlsx
+    * <stem>_validation_report.xlsx
+- Optional OneDrive save (local only).
 
 Requires:
 - Python 3.8+
@@ -52,7 +43,7 @@ st.set_page_config(
 
 # ---------------------- VERBOSE LOGGING --------------------------------------
 def get_logger(verbose: bool):
-    logs = []
+    logs: List[str] = []
 
     def info(msg: str):
         if verbose:
@@ -92,18 +83,21 @@ PROJECT_FOLDER = os.path.join(
     "04. Tools"
 )
 
-# Historical/expected exact names
+# Fixed expected file names
 MASTER_FILENAMES = [
     "260101_Aicraft_Master.xlsx",
     "260101_Aircraft_Master.xlsx",
 ]
 
-# Regex patterns (case-insensitive) to match more liberally during auto-search
+# Regex patterns (case-insensitive) for broader auto-search
 MASTER_REGEX_PATTERNS = [
-    r"(?i)\b(?:\d{6}_)?aicraft_master\.xlsx$",   # tolerate date prefix + typo 'Aicraft'
+    r"(?i)\b(?:\d{6}_)?aicraft_master\.xlsx$",   # tolerate date prefix + 'Aicraft' typo
     r"(?i)\b(?:\d{6}_)?aircraft_master\.xlsx$",  # tolerate date prefix
-    r"(?i)\b.*aircraft.*master.*\.xlsx$",        # broader fallback
+    r"(?i)\b.*aircraft.*master.*\.xlsx$",        # broad fallback
 ]
+
+# Repo-bundled Master (Option B)
+REPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "data", "260101_Aircraft_Master.xlsx")
 
 MANUFACTURER_COL_CANDIDATES = ["manufacturer", "aircraft manufacturer", "mfr", "oem", "maker"]
 TYPE_COL_CANDIDATES         = ["type", "aircraft type", "model", "family", "series", "aircraft model"]
@@ -117,9 +111,9 @@ TYPE_ICAO_COL_CANDIDATES    = [
 ]
 
 # Defaults (can be overridden via sidebar)
-DEFAULT_SUGGESTION_COUNT  = 3
-DEFAULT_SUGGESTION_CUTOFF = 0.60  # minimum similarity to keep a combo suggestion
-DEFAULT_MASTER_SEARCH_DEPTH = 6   # depth for recursive OneDrive Master search
+DEFAULT_SUGGESTION_COUNT   = 3
+DEFAULT_SUGGESTION_CUTOFF  = 0.60   # minimum similarity to keep a combo suggestion
+DEFAULT_MASTER_SEARCH_DEPTH = 6     # depth for recursive OneDrive Master search
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -167,6 +161,7 @@ def pick_column(df: pd.DataFrame, candidates: Iterable[str]) -> str:
 
 
 def try_pick_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    """Best-effort version of pick_column."""
     try:
         return pick_column(df, candidates)
     except ValueError:
@@ -186,7 +181,7 @@ def normalize_code_alias(code: str) -> Tuple[str, Set[str]]:
         return "", set()
 
     raw = str(code).strip()
-    key = re.sub(r"[\s\-]+", "", raw)  # remove spaces/hyphens for mapping keys
+    key = re.sub(r"[\s\-]+", "", raw)  # remove spaces/hyphens
 
     aliases = {key}
     m = re.match(r"^([A-Za-z]{0,2})(\d{2,3})([A-Za-z]{0,2})$", key)
@@ -218,15 +213,12 @@ def family_key(t: str) -> str:
 def is_variant_type(t: str) -> bool:
     """
     Returns True if type string includes variant letters (prefix or suffix)
-    beyond the canonical number-hyphen-number pattern:
-    e.g., 'B737-800', 'B737-800W', '737-800BCF', '737-800ER', etc.
+    beyond the canonical number-hyphen-number pattern.
     """
     x = t.replace("-", "")
-    # leading letters like 'B737800' are non-canonical
-    if re.match(r"^[A-Za-z]+\d+", x):
+    if re.match(r"^[A-Za-z]+\d+", x):  # leading letters
         return True
-    # trailing letters like '737800W' or '737800BCF'
-    if re.search(r"[A-Za-z]+$", x) and not x.isdigit():
+    if re.search(r"[A-Za-z]+$", x) and not x.isdigit():  # trailing letters
         return True
     return False
 
@@ -248,22 +240,22 @@ def master_path_candidates() -> List[str]:
     return candidates
 
 
+def list_existing_onedrive_roots() -> List[str]:
+    roots = MAC_ONEDRIVE_ROOTS if platform.system() == "Darwin" else WIN_ONEDRIVE_ROOTS
+    return [r for r in roots if os.path.exists(r)]
+
+
 # --- OneDrive output resolution & save helpers -------------------------------
 
 def resolve_onedrive_output_dir(custom_subdir: Optional[str] = None) -> Optional[str]:
     """
-    Resolve a writable OneDrive output directory:
-    - Picks the first existing OneDrive root (macOS or Windows).
-    - Uses the configured PROJECT_FOLDER by default.
-    - If custom_subdir is provided, it is sanitized and appended (or used as absolute if under OneDrive).
-    Returns a normalized absolute path, or None if no root exists.
+    Resolve a writable OneDrive output directory (local only).
     """
-    roots = MAC_ONEDRIVE_ROOTS if platform.system() == "Darwin" else WIN_ONEDRIVE_ROOTS
-    existing_roots = [r for r in roots if os.path.exists(r)]
-    if not existing_roots:
+    roots = list_existing_onedrive_roots()
+    if not roots:
         return None
 
-    base_root = existing_roots[0]
+    base_root = roots[0]
     if custom_subdir:
         sub = sanitize_path(custom_subdir)
         if os.path.isabs(sub) and sub.startswith(base_root):
@@ -299,12 +291,7 @@ def original_file_stem(filename: Optional[str]) -> str:
         return "import"
 
 
-# --- OneDrive Master auto-discovery ------------------------------------------
-
-def list_existing_onedrive_roots() -> List[str]:
-    roots = MAC_ONEDRIVE_ROOTS if platform.system() == "Darwin" else WIN_ONEDRIVE_ROOTS
-    return [r for r in roots if os.path.exists(r)]
-
+# --- OneDrive Master auto-discovery (local only) -----------------------------
 
 def depth_limited_walk(root: str, max_depth: int):
     """
@@ -316,7 +303,6 @@ def depth_limited_walk(root: str, max_depth: int):
     for dirpath, dirnames, filenames in os.walk(root):
         depth = os.path.normpath(dirpath).count(os.sep) - root_sep_count
         if depth >= max_depth:
-            # prevent os.walk from descending further
             dirnames[:] = []
         yield dirpath, dirnames, filenames
 
@@ -334,11 +320,10 @@ def find_master_in_onedrive_cached(roots: Tuple[str, ...],
             continue
         for dirpath, _, filenames in depth_limited_walk(root, max_depth=max_depth):
             for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                # quick extension check before regex
                 if not fn.lower().endswith(".xlsx"):
                     continue
                 if any(rx.search(fn) for rx in compiled):
+                    full = os.path.join(dirpath, fn)
                     matches.append(full)
                     if stop_after_first:
                         return matches
@@ -350,7 +335,7 @@ def find_master_candidates_via_auto_search(info, debug,
                                            stop_after_first: bool = True) -> List[str]:
     roots = tuple(list_existing_onedrive_roots())
     if not roots:
-        info("No OneDrive roots available for auto-search.")
+        info("No OneDrive roots available for auto-search (local).")
         return []
     info(f"Auto-searching Master under OneDrive roots: {roots} (max_depth={max_depth}, stop_after_first={stop_after_first})")
     matches = find_master_in_onedrive_cached(roots, tuple(MASTER_REGEX_PATTERNS), max_depth, stop_after_first)
@@ -398,11 +383,9 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
     master_df["__engine__"] = master_df[eng_col].apply(normalize_preserve_case)
     master_df["__icao__"]   = master_df[type_icao_col].apply(normalize_preserve_case) if type_icao_col else ""
 
-    # Helper to detect a valid ICAO (non-empty and not 'N/A')
     def is_valid_icao(v: str) -> bool:
         return bool(v) and str(v).strip().upper() != "N/A"
 
-    # Combo -> ID (case-sensitive)
     lookup: Dict[Tuple[str, str, str], str] = {}
     for _, r in master_df.iterrows():
         key = (r["__man__"], r["__type__"], r["__engine__"])
@@ -416,7 +399,6 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
     info(f"Unique counts — Manufacturers: {len(man_set)}, Types: {len(type_set)}, Engines: {len(eng_set)}")
     info(f"Valid (Manufacturer,Type,Engine) combinations: {len(lookup)}")
 
-    # Type -> ICAO map & valid-code type set
     type_to_icao: Dict[str, str] = {}
     valid_code_types: Set[str] = set()
     if type_icao_col:
@@ -428,7 +410,6 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
             if is_valid_icao(code):
                 valid_code_types.add(t)
 
-    # ICAO/IATA -> Type(s) mapping (alias-aware), skip 'N/A'
     icao_to_types: Dict[str, Set[str]] = {}
     if type_icao_col:
         for _, r in master_df.iterrows():
@@ -441,13 +422,8 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
                 icao_to_types.setdefault(a, set()).add(tval)
         debug(f"ICAO map keys loaded: {len(icao_to_types)}")
 
-    # Precompute combo lists
     combo_list_all = list(lookup.keys())
-    # Exclude any combo whose Type has ICAO 'N/A' (or empty)
-    if type_icao_col:
-        combo_list_valid_code = [c for c in combo_list_all if c[1] in valid_code_types]
-    else:
-        combo_list_valid_code = combo_list_all[:]  # no ICAO column -> cannot filter
+    combo_list_valid_code = [c for c in combo_list_all if c[1] in valid_code_types] if type_icao_col else combo_list_all[:]
 
     debug(f"Combos (all): {len(combo_list_all)}, combos (valid code only): {len(combo_list_valid_code)}")
 
@@ -528,7 +504,6 @@ def process_import(
         type_raw = import_df.at[idx, imp_type_col]
         eng_raw  = import_df.at[idx, imp_eng_col]
 
-        # Keep a normalized version of the ORIGINAL input type for exact comparisons in family
         type_raw_norm = normalize_preserve_case(type_raw)
 
         man = row["__man__"]
@@ -565,9 +540,8 @@ def process_import(
         if master["type_icao_col"]:
             for a in alias_candidates:
                 mapped_types |= master["icao_to_types"].get(a, set())
-        icao_type_suggestions = sorted(mapped_types)  # already exclude 'N/A' coded types
+        icao_type_suggestions = sorted(mapped_types)
 
-        # Prefer exact combos unlocked via ICAO/IATA-derived types (manufacturer/engine fixed)
         if master["type_icao_col"]:
             for t_candidate in icao_type_suggestions:
                 candidate_combo = (man, t_candidate, eng)
@@ -578,17 +552,14 @@ def process_import(
         fam_key = family_key(type_raw_norm)
         family_types = {t for t in master["type_set"] if family_key(t) == fam_key}
         if master["type_icao_col"]:
-            # Restrict to types with valid ICAO codes unless override is enabled
             family_types = {t for t in family_types if t in master["valid_code_types"]}
 
         # ---------- Fuzzy scoring sets ----------
-        # Global fuzzy across combos **with valid ICAO code only**
         global_combos = master["combo_list_valid_code"]
         global_scored = [] if combo_ok else score_combos_against(
             man, typ, eng, global_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
         )
 
-        # Fuzzy restricted to family Types (and robust manufacturer match)
         filtered_combos = [
             c for c in master["combo_list_valid_code"]
             if man_eq(c[0], man) and (c[1] in family_types)
@@ -597,7 +568,7 @@ def process_import(
             man, typ, eng, filtered_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
         )
 
-        # ---------- Original-type-first preference (works with family) ----------
+        # ---------- Original-type-first ----------
         original_type_hits = []
         if (not combo_ok) and (type_raw_norm in family_types):
             preferred_type_combos = [
@@ -609,7 +580,7 @@ def process_import(
                     man, typ, eng, preferred_type_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
                 )
 
-        # ---------- Base-type-first within family (if original type not present) ----------
+        # ---------- Base-type-first ----------
         base_type_hits = []
         if (not combo_ok) and (not original_type_hits) and family_types:
             base_family_types = [t for t in family_types if not is_variant_type(t)]
@@ -628,8 +599,8 @@ def process_import(
         if (not combo_ok) and filtered_combos and not original_type_hits and not base_type_hits:
             for (m, t, e) in filtered_combos:
                 base_score  = difflib.SequenceMatcher(None, f"{man} {typ} {eng}", f"{m} {t} {e}").ratio()
-                shape_score = difflib.SequenceMatcher(None, str(type_raw), t).ratio()  # original input vs candidate type
-                penalty     = 0.25 if is_variant_type(t) else 0.0  # stronger penalty for variants
+                shape_score = difflib.SequenceMatcher(None, str(type_raw), t).ratio()
+                penalty     = 0.25 if is_variant_type(t) else 0.0
                 final_score = (base_score * 0.4) + (shape_score * 0.6) - penalty
                 canonical_ranked.append((final_score, (m, t, e), master["lookup"][(m, t, e)]))
             canonical_ranked.sort(reverse=True, key=lambda x: x[0])
@@ -678,7 +649,7 @@ def process_import(
         suggested_import.at[idx, imp_type_col] = sug_typ
         suggested_import.at[idx, imp_eng_col]  = sug_eng
         if imp_id_col is not None:
-            suggested_import.at[idx, imp_id_col] = sug_mid  # update ID ONLY if original has such a column
+            suggested_import.at[idx, imp_id_col] = sug_mid  # update ID only if present
 
         # Collect validation row (diagnostics)
         validation_rows.append({
@@ -698,7 +669,6 @@ def process_import(
             "SuggestionsType": "; ".join(type_suggestions),
             "SuggestionsTypeFromICAO": "; ".join(icao_type_suggestions),
             "SuggestionsEngine": "; ".join(eng_suggestions),
-            # Lists of combos for transparency
             "SuggestionsCombo_CodeRestricted": " | ".join([f"{m} {t} {e}" for _, (m,t,e), _ in filtered_scored]),
             "SuggestionsCombo_Global": " | ".join([f"{m} {t} {e}" for _, (m,t,e), _ in global_scored]),
             "SuggestionsComboFromICAO": " | ".join([f"{m} {t} {e}" for _, (m,t,e), _ in icao_combo_hits]),
@@ -740,7 +710,6 @@ def process_import(
         ws = wb["Validation"]
         header_row = [cell.value for cell in ws[1]]
 
-        # Columns to hide (by header name)
         cols_to_hide = [
             "Manufacturer_norm",
             "Type_norm",
@@ -752,7 +721,6 @@ def process_import(
             "SuggestionsComboFromICAO",
         ]
 
-        # Hide the specified columns if they exist
         name_to_idx = {str(v): i+1 for i, v in enumerate(header_row) if v is not None}
         for name in cols_to_hide:
             if name in name_to_idx:
@@ -763,7 +731,6 @@ def process_import(
         wb.save(out_validation)
         out_validation.seek(0)
     except Exception:
-        # Fallback: use the original (unhidden) version
         out_validation = validation_bytes
 
     # 2) Suggested Import (keeps exact original header order & structure)
@@ -787,11 +754,24 @@ def process_import(
     return out_validation, out_suggested, metrics, summary_df, report_df, suggested_import
 
 
+# ---------------------- Cloud detection --------------------------------------
+
+def running_in_cloud() -> bool:
+    """
+    Lightweight detection for Streamlit Cloud. If environment can't see any OneDrive roots,
+    treat as cloud, or rely on Streamlit runtime hints if available.
+    """
+    runtime_hint = os.getenv("STREAMLIT_RUNTIME", "")
+    server_enabled = os.getenv("STREAMLIT_SERVER_ENABLED") == "1"
+    no_onedrive_roots = len(list_existing_onedrive_roots()) == 0
+    return server_enabled or runtime_hint.startswith("streamlit") or no_onedrive_roots
+
+
 # ---------------------- UI LAYOUT -------------------------------------------
 
 st.title("🛫 SafetyManager365")
 st.subheader("Aircraft Import Validator & Suggester")
-st.caption("Ruben Inion v0.2 2026 — original-name outputs, OneDrive save, auto Master discovery.")
+st.caption("Ruben Inion v0.3 — Original-name outputs, OneDrive save (local), Repo-bundled Master for Cloud.")
 
 with st.sidebar:
     st.header("Settings")
@@ -801,14 +781,14 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Master source")
-    master_upload = st.file_uploader("Upload Master Excel (.xlsx) to override auto-detection", type=["xlsx"])
-    auto_search_master = st.checkbox("Auto-search Master across OneDrive (fallback)", value=True)
+    master_upload = st.file_uploader("Upload Master Excel (.xlsx) (overrides everything)", type=["xlsx"])
+    auto_search_master = st.checkbox("Local: Auto-search Master across OneDrive (fallback)", value=True)
     max_search_depth = st.slider("Auto-search depth", min_value=2, max_value=12, value=DEFAULT_MASTER_SEARCH_DEPTH, step=1,
                                  help="Limits recursion when scanning your OneDrive to find the Master file.")
 
     st.divider()
     st.subheader("Output")
-    save_to_onedrive = st.checkbox("Save to OneDrive", value=False, help="Save output files to your OneDrive")
+    save_to_onedrive = st.checkbox("Local: Save to OneDrive", value=False, help="Save output files to your OneDrive (local only)")
     onedrive_subfolder = st.text_input(
         "OneDrive subfolder (optional)",
         value=PROJECT_FOLDER,
@@ -831,38 +811,61 @@ run_btn = st.button("▶️ Validate & Suggest", type="primary", disabled=(impor
 master_dict: Optional[Dict] = None
 master_status_lines: List[str] = []
 
+cloud = running_in_cloud()
+if cloud:
+    master_status_lines.append("Cloud mode detected.")
+else:
+    master_status_lines.append("Local mode detected.")
+
 if master_upload is not None:
     try:
         master_dict = load_master_from_buffer(master_upload, info, debug)
         master_status_lines.append("Using **uploaded Master**.")
     except Exception as e:
         st.error(f"Failed to load uploaded Master: {e}")
-
 else:
-    # First try fixed candidates
-    candidates = master_path_candidates()
-    existing = [p for p in candidates if os.path.exists(p)]
-    if existing:
-        try:
-            master_dict = load_master_from_path(existing[0], info, debug)
-            master_status_lines.append(f"Master auto-detected (fixed path): `{existing[0]}`")
-        except Exception as e:
-            st.error(f"Failed to read detected Master: {e}")
-    else:
-        master_status_lines.append("No fixed-path OneDrive Master found.")
-        # Auto-search (fallback)
-        if auto_search_master:
-            matches = find_master_candidates_via_auto_search(info, debug, max_depth=max_search_depth, stop_after_first=True)
-            if matches:
-                try:
-                    master_dict = load_master_from_path(matches[0], info, debug)
-                    master_status_lines.append(f"Master found via **OneDrive auto-search**: `{matches[0]}`")
-                except Exception as e:
-                    st.error(f"Failed to read auto-searched Master: {e}")
-            else:
-                master_status_lines.append("Auto-search did not find a Master file. You can upload a Master file in the sidebar.")
+    if cloud:
+        # Streamlit Cloud: use the repo-bundled Master if present
+        if os.path.exists(REPO_MASTER_FALLBACK):
+            try:
+                master_dict = load_master_from_path(REPO_MASTER_FALLBACK, info, debug)
+                master_status_lines.append(f"Using repo-bundled Master: `{REPO_MASTER_FALLBACK}`")
+            except Exception as e:
+                st.error(f"Failed to read repo-bundled Master: {e}")
+                master_status_lines.append("Please upload the Master in the sidebar.")
         else:
-            master_status_lines.append("Auto-search disabled. You can upload a Master file in the sidebar.")
+            master_status_lines.append("Repo-bundled Master not found. Please upload the Master in the sidebar.")
+    else:
+        # Local: try fixed paths first
+        candidates = master_path_candidates()
+        existing = [p for p in candidates if os.path.exists(p)]
+
+        # Show candidates + existence in status
+        master_status_lines.append("Fixed-path candidates (local):")
+        for p in candidates:
+            master_status_lines.append(f"- {p} {'✅' if os.path.exists(p) else '❌'}")
+
+        if existing:
+            try:
+                master_dict = load_master_from_path(existing[0], info, debug)
+                master_status_lines.append(f"Master auto-detected (fixed path): `{existing[0]}`")
+            except Exception as e:
+                st.error(f"Failed to read detected Master: {e}")
+        else:
+            master_status_lines.append("No fixed-path OneDrive Master found.")
+            # Auto-search (fallback)
+            if auto_search_master:
+                matches = find_master_candidates_via_auto_search(info, debug, max_depth=max_search_depth, stop_after_first=True)
+                if matches:
+                    try:
+                        master_dict = load_master_from_path(matches[0], info, debug)
+                        master_status_lines.append(f"Master found via **OneDrive auto-search**: `{matches[0]}`")
+                    except Exception as e:
+                        st.error(f"Failed to read auto-searched Master: {e}")
+                else:
+                    master_status_lines.append("Auto-search did not find a Master file. You can upload a Master file in the sidebar.")
+            else:
+                master_status_lines.append("Auto-search disabled. You can upload a Master file in the sidebar.")
 
 master_source_placeholder.markdown("\n\n".join(master_status_lines))
 
@@ -873,7 +876,7 @@ if run_btn and import_upload is not None:
         info(f"Import rows loaded: {len(import_df)}")
 
         if master_dict is None:
-            st.error("Master dataset is not available. Please upload a Master file or enable OneDrive auto-search.")
+            st.error("Master dataset is not available. Please upload a Master file.")
         else:
             # Derive stem from uploaded filename
             import_stem = original_file_stem(getattr(import_upload, "name", None))
@@ -888,11 +891,11 @@ if run_btn and import_upload is not None:
                 orig_stem=import_stem,
             )
 
-            # Optional OneDrive Save
-            if save_to_onedrive:
+            # Optional OneDrive Save (local only)
+            if save_to_onedrive and not cloud:
                 output_dir = resolve_onedrive_output_dir(onedrive_subfolder)
                 if output_dir is None:
-                    st.warning("OneDrive root not found. Files were not saved. Please check your OneDrive setup.")
+                    st.warning("OneDrive root not found locally. Files were not saved.")
                     info("OneDrive save skipped: no OneDrive root detected.")
                 else:
                     sugg_path = os.path.join(output_dir, metrics["sugg_name"])
