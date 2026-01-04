@@ -189,6 +189,36 @@ def normalize_code_alias(code: str) -> Tuple[str, Set[str]]:
     return key, aliases
 
 
+# --- Engine fallback helper ---------------------------------------------------
+
+def pick_first_engine_for(man: str, typ: str, master: Dict) -> Tuple[str, str]:
+    """
+    Return (engine, master_id) for the first suitable (Manufacturer, Type, Engine) combo.
+    Preference order:
+      1) combos from combo_list_valid_code (if ICAO column detected),
+      2) otherwise from combo_list_all.
+    Deterministic: stable sort by engine string.
+    """
+    # Prefer valid-code combos when ICAO is present
+    base_pool = master["combo_list_valid_code"] if master.get("type_icao_col") else master["combo_list_all"]
+
+    # Filter to same manufacturer & type (case-sensitive first, case-insensitive fallback via man_eq)
+    candidates = [c for c in base_pool if man_eq(c[0], man) and c[1] == typ]
+    if not candidates:
+        # As a fallback, allow case-insensitive type match
+        candidates = [c for c in base_pool if man_eq(c[0], man) and c[1].upper() == typ.upper()]
+
+    # Deterministic pick: sort by engine name
+    candidates.sort(key=lambda c: (str(c[2])))
+
+    if candidates:
+        m, t, e = candidates[0]
+        mid = master["lookup"].get((m, t, e), "")
+        return e, mid
+
+    # No engine found for the given man+type
+    return "", ""
+
 def family_key(t: str) -> str:
     """
     Derive a family key from a Type string:
@@ -202,6 +232,7 @@ def family_key(t: str) -> str:
     """
     tn = normalize_preserve_case(t)
     return re.sub(r"[A-Za-z](?=\d)", "", tn)
+
 
 def is_variant_type(t: str) -> bool:
     """
@@ -636,11 +667,30 @@ def process_import(
         debug(f"[Row {idx}] → Suggestion source: {suggestion_source}")
         debug(f"[Row {idx}] → Suggested combo: {sug_combo} | MasterID={sug_mid if sug_mid else '—'}")
 
-        # Write into Suggested Import (preserving original columns/order)
+        # ---------- Engine-aware writeback (fills missing engine) ----------
         sug_man, sug_typ, sug_eng = sug_combo
-        suggested_import.at[idx, imp_man_col]  = sug_man
+
+        # Detect missing engine in original import (empty or NaN)
+        engine_missing_in_import = (pd.isna(eng_raw) or normalize_preserve_case(eng_raw) == "")
+
+        # If engine was missing, pick the first suitable engine for man+type
+        if engine_missing_in_import:
+            # If we don't already have an engine in the suggested combo, resolve one
+            if not sug_eng or normalize_preserve_case(sug_eng) == "":
+                fallback_eng, fallback_mid = pick_first_engine_for(sug_man, sug_typ, master)
+                if fallback_eng:
+                    sug_eng = fallback_eng
+                    # If we didn't have a MasterID yet or it doesn't match, refresh it
+                    if not sug_mid:
+                        sug_mid = fallback_mid
+                else:
+                    # No engine found for man+type; keep empty, MasterID may remain empty too
+                    pass
+
+        # Write into Suggested Import (preserving original columns/order)
+        suggested_import.at[idx, imp_man_col] = sug_man
         suggested_import.at[idx, imp_type_col] = sug_typ
-        suggested_import.at[idx, imp_eng_col]  = sug_eng
+        suggested_import.at[idx, imp_eng_col] = sug_eng
         if imp_id_col is not None:
             suggested_import.at[idx, imp_id_col] = sug_mid  # update ID only if present
 
