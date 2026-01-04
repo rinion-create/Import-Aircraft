@@ -3,24 +3,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Streamlit App — Aircraft import validator & suggester
-(CASE-SENSITIVE, hyphen-preserving, ICAO alias-aware, avoids 'N/A' code suggestions,
- original-type-first, base-family preference, canonical preference, preserves original import structure)
+Aircraft import validator & suggester
 
-Option B: Bundle a read-only Master with the repo for Streamlit Cloud.
-
-Behavior:
+Behaviour:
 - Upload Master: always honored (local or cloud).
 - Cloud mode (detected): fall back to repo-bundled Master at ./260101_Aircraft_Master.xlsx.
-- Local mode: try fixed OneDrive paths, then auto-search; fallback to upload.
-- Outputs keep original import filename with suffixes:
+- Local mode: try  OneDrive paths, then auto-search; fallback to upload.
+- Outputs original import filename with suffixes:
     * <stem>_import_ready.xlsx
     * <stem>_validation_report.xlsx
 - Optional OneDrive save (local only).
 
-Requires:
-- Python 3.8+
-- pandas (openpyxl engine)
 """
 
 import io
@@ -36,7 +29,7 @@ import streamlit as st
 
 # ---------------------- UI CONFIG --------------------------------------------
 st.set_page_config(
-    page_title="Aircraft Import Validator & Suggester",
+    page_title="SM365 Aircraft Import Validator",
     page_icon="🛫",
     layout="wide",
 )
@@ -65,14 +58,14 @@ def get_logger(verbose: bool):
 # Dynamic OneDrive folder resolution under the current user's HOME
 HOME = os.path.expanduser("~")
 
-# macOS OneDrive mount root (typical)
+# macOS OneDrive mount root
 MAC_ONEDRIVE_ROOTS = [
     os.path.join(HOME, "Library", "CloudStorage", "OneDrive-Comply365"),
     os.path.join(HOME, "Library", "CloudStorage", "OneDrive - Comply365"),
     os.path.join(HOME, "Library", "CloudStorage", "OneDrive"),
 ]
 
-# Windows OneDrive root (typical)
+# Windows OneDrive root
 WIN_ONEDRIVE_ROOTS = [
     os.path.join(HOME, "OneDrive - Comply365"),
     os.path.join(HOME, "OneDrive"),
@@ -931,9 +924,10 @@ if run_btn and import_upload is not None:
             st.subheader("Suggested Import preview")
             st.dataframe(suggested_import.head(50), use_container_width=True)
 
-            # Downloads
+            # ---------------------- Downloads --------------------------------------------
             st.subheader("Downloads")
-            cdl1, cdl2 = st.columns(2)
+            cdl1, cdl2, cdl3 = st.columns(3)
+
             with cdl1:
                 st.download_button(
                     label=f"⬇️ Download Validation Report ({metrics['report_name']})",
@@ -941,6 +935,7 @@ if run_btn and import_upload is not None:
                     file_name=metrics["report_name"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
             with cdl2:
                 st.download_button(
                     label=f"⬇️ Download Suggested Import ({metrics['sugg_name']})",
@@ -948,6 +943,33 @@ if run_btn and import_upload is not None:
                     file_name=metrics["sugg_name"],
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
+
+            # New: ZIP download with both files at once
+            with cdl3:
+                # Ensure buffers are rewound before zipping
+                out_validation.seek(0)
+                out_suggested.seek(0)
+
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    # Write both Excel buffers to the ZIP with the desired filenames
+                    zf.writestr(metrics["report_name"], out_validation.read())
+                    # Reset to start again since we've read the buffer
+                    out_validation.seek(0)
+
+                    zf.writestr(metrics["sugg_name"], out_suggested.read())
+                    out_suggested.seek(0)
+
+                zip_buf.seek(0)
+
+                st.download_button(
+                    label="⬇️ Download Both (ZIP)",
+                    data=zip_buf,
+                    file_name=f"{original_file_stem(getattr(import_upload, 'name', None))}_outputs.zip",
+                    mime="application/zip",
+                    help="Downloads both the validation report and the suggested import together.",
+                )
+
 
     except Exception as e:
         st.error(f"Processing failed: {e}")
