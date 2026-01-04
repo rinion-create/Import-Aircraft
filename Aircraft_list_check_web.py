@@ -21,6 +21,7 @@ import os
 import re
 import difflib
 import platform
+import zipfile
 from datetime import datetime
 from typing import Optional, Tuple, Set, Dict, List, Iterable
 
