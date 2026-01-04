@@ -201,8 +201,7 @@ def family_key(t: str) -> str:
       'A320-214'   -> '320-214'
     """
     tn = normalize_preserve_case(t)
-    return re.sub(r"[A-Za-z]", "", tn)
-
+    return re.sub(r"[A-Za-z](?=\d)", "", tn)
 
 def is_variant_type(t: str) -> bool:
     """
