@@ -3,17 +3,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Aircraft import validator & suggester
+SafetyManager365 — Aircraft Import Validator & Suggester
 
-Behaviour:
-- Upload Master: always honored (local or cloud).
-- Cloud mode (detected): fall back to repo-bundled Master at ./260101_Aircraft_Master.xlsx.
-- Local mode: try  OneDrive paths, then auto-search; fallback to upload.
-- Outputs original import filename with suffixes:
-    * <stem>_import_ready.xlsx
-    * <stem>_validation_report.xlsx
-- Optional OneDrive save (local only).
-
+This build:
+- REMOVES Fix A (manufacturer hard guard). Manufacturer presence in Master does NOT block suggestions.
+- KEEPS Fix C (numeric family hard lock): reject any suggestion whose family != original family.
+- Exact Master display strings written back to SuggestedImport (spacing/casing preserved).
+- Prevent cross-platform collisions via ICAO alias guard and type prefix family restriction.
+- Prefer same-manufacturer candidates; ICAO suggestions require manufacturer equality.
+- Bell Textron normalization additions (locale token 'Canada', explicit aliases, broad regex).
+- Marking in SuggestedImport uses exact Master display strings only (no normalization).
+- Validation report contains AircraftRegistration as first column; no Summary sheet.
 """
 
 import io
@@ -56,7 +56,6 @@ def get_logger(verbose: bool):
 
 # --- Configuration -----------------------------------------------------------
 
-# Dynamic OneDrive folder resolution under the current user's HOME
 HOME = os.path.expanduser("~")
 
 # macOS OneDrive mount root
@@ -79,7 +78,7 @@ PROJECT_FOLDER = os.path.join(
 
 # Fixed expected file names
 MASTER_FILENAMES = [
-    "260101_Aicraft_Master.xlsx",
+    "260101_Aicraft_Master.xlsx",  # keep typo tolerance
     "260101_Aircraft_Master.xlsx",
 ]
 
@@ -90,7 +89,7 @@ MASTER_REGEX_PATTERNS = [
     r"(?i)\b.*aircraft.*master.*\.xlsx$",        # broad fallback
 ]
 
-# Repo-bundled Master (Option B)
+# Repo-bundled Master fallback (for cloud)
 REPO_MASTER_FALLBACK = os.path.join(os.path.dirname(__file__), "260101_Aircraft_Master.xlsx")
 
 MANUFACTURER_COL_CANDIDATES = ["manufacturer", "aircraft manufacturer", "mfr", "oem", "maker"]
@@ -104,10 +103,10 @@ TYPE_ICAO_COL_CANDIDATES    = [
     "type designator", "icao aircraft type", "icao model"
 ]
 
-# Defaults (can be overridden via sidebar)
+# Defaults
 DEFAULT_SUGGESTION_COUNT   = 3
-DEFAULT_SUGGESTION_CUTOFF  = 0.60   # minimum similarity to keep a combo suggestion
-DEFAULT_MASTER_SEARCH_DEPTH = 6     # depth for recursive OneDrive Master search
+DEFAULT_SUGGESTION_CUTOFF  = 0.60
+DEFAULT_MASTER_SEARCH_DEPTH = 6
 
 # --- Helpers ----------------------------------------------------------------
 
@@ -120,7 +119,6 @@ def sanitize_path(p: str) -> str:
         p = p[1:-1]
     p = os.path.expanduser(os.path.expandvars(p))
     return os.path.normpath(p)
-
 
 def normalize_preserve_case(value) -> str:
     """
@@ -138,6 +136,143 @@ def normalize_preserve_case(value) -> str:
     s = re.sub(r"\s+", " ", s)                # collapse spaces
     return s
 
+# --- Type-specific normalization --------------------------------------------
+
+TYPE_SPACE_FIXES = [
+    (r'(?<=\b[A-Za-z])\s+(?=\d)', ''),    # 'R 44' -> 'R44', 'EC 135' -> 'EC135'
+    (r'(?<=\d)\s+(?=[A-Za-z])', ''),      # '44 II' -> '44II', '135 T2 +' -> '135T2 +'
+]
+
+TYPE_VARIANT_FIXES = [
+    (r'\s*\+\s*', '+'),                   # compact plus
+    (r'\bPLUS\b', '+'),                   # 'PLUS' -> '+'
+]
+
+def normalize_type(value) -> str:
+    """
+    Type-specific normalization:
+    - preserve case/hyphens
+    - remove letter<->digit spaces
+    - compact '+' / 'PLUS'
+    Examples:
+      'EC 135 P2 +' -> 'EC135 P2+'
+      'EC135 P2 PLUS' -> 'EC135 P2+'
+    """
+    s = normalize_preserve_case(value)
+    for pat, repl in TYPE_SPACE_FIXES:
+        s = re.sub(pat, repl, s)
+    for pat, repl in TYPE_VARIANT_FIXES:
+        s = re.sub(pat, repl, s, flags=re.IGNORECASE)
+    return s
+
+# --- Variant synonym harmonization ------------------------------------------
+
+TYPE_SYNONYMS: Dict[str, str] = {
+    # Example: EC135 T2+ -> EC135 T2 Series (uncomment if your Master uses 'Series')
+    # "EC135 T2+": "EC135 T2 Series",
+    # "EC135 P2+": "EC135 P2 Series",
+    # "A320 NEO": "A320-251N",
+    # "320N": "A320-251N",
+}
+
+def harmonize_type_variants(t: str) -> str:
+    """Normalize then apply synonym mapping to align to Master canonical tokens."""
+    nt = normalize_type(t)
+    canon = TYPE_SYNONYMS.get(nt)
+    return normalize_type(canon) if canon else nt
+
+# --- Manufacturer normalization & aliasing ----------------------------------
+
+def clean_dangling_punct(s: str) -> str:
+    """Remove stray trailing/leading punctuation and compress spaces."""
+    s = re.sub(r"\s*[,.;:]\s*$", "", s)     # trailing , . ; :
+    s = re.sub(r"^\s*[,.;:]\s*", "", s)     # leading , . ; :
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+LEGAL_SUFFIXES = [
+    r"\bGmbH\b", r"\bAG\b", r"\bInc\.?\b", r"\bIncorporated\b", r"\bLLC\b",
+    r"\bLtd\.?\b", r"\bLimited\b", r"\bSAS\b", r"\bSA\b", r"\bBV\b", r"\bNV\b",
+    r"\bS\.?p\.?A\.?\b",
+]
+
+LOCALE_TOKENS = [
+    r"\bDeutschland\b", r"\bFrance\b", r"\bUSA\b", r"\bUK\b", r"\bGroupe\b",
+    r"\bCanada\b",
+]
+
+def normalize_manufacturer_import(value: str) -> str:
+    """Import rows: remove legal/locale suffixes, fix punctuation."""
+    s = normalize_preserve_case(value)
+    for pat in LEGAL_SUFFIXES:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE)
+    for pat in LOCALE_TOKENS:
+        s = re.sub(pat, "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = clean_dangling_punct(s)
+    return s
+
+def normalize_manufacturer_master(value: str) -> str:
+    """Master rows: keep legal suffixes; fix punctuation only."""
+    s = normalize_preserve_case(value)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = clean_dangling_punct(s)
+    return s
+
+MANUFACTURER_ALIASES: Dict[str, str] = {
+    # Eurocopter consolidation
+    "EUROCOPTER": "EUROCOPTER",
+    "EUROCOPTER DEUTSCHLAND": "EUROCOPTER",
+    "EUROCOPTER FRANCE": "EUROCOPTER",
+
+    # MD Helicopters
+    "MD HELICOPTERS": "MD HELICOPTERS, INC.",
+    "MD HELICOPTERS INC": "MD HELICOPTERS, INC.",
+    "MD HELICOPTERS, INC": "MD HELICOPTERS, INC.",
+    "MD HELICOPTERS,": "MD HELICOPTERS, INC.",
+
+    # Bell Textron variants (explicit)
+    "BELL TEXTRON": "BELL",
+    "BELL TEXTRON CANADA": "BELL",
+    "BELL TEXTRON CANADA LTD": "BELL",
+    "BELL TEXTRON INC": "BELL",
+}
+
+MANUFACTURER_REGEX_ALIASES: List[Tuple[re.Pattern, str]] = [
+    (re.compile(r'^\s*Bell\s+Helicopter\s+Textron\b.*', re.IGNORECASE), "BELL"),
+    (re.compile(r'^\s*Bell\b.*\bTextron\b.*', re.IGNORECASE), "BELL"),
+    (re.compile(r'^\s*Westland\s+Helicopter\b.*', re.IGNORECASE), "AGUSTAWESTLAND"),
+    (re.compile(r'^\s*Costr\.?\s*Aeronaut\.?G\.?Agusta\b.*', re.IGNORECASE), "AGUSTAWESTLAND"),
+    (re.compile(r'\bAgusta\s*Westland\b', re.IGNORECASE), "AGUSTAWESTLAND"),
+    (re.compile(r'\bAgustaWestland\b', re.IGNORECASE), "AGUSTAWESTLAND"),
+]
+
+def canonicalize_manufacturer(s: str) -> str:
+    """Alias manufacturer via explicit dict, then regex fallbacks."""
+    key = s.upper()
+    mapped = MANUFACTURER_ALIASES.get(key)
+    if mapped:
+        return mapped
+    for rx, target in MANUFACTURER_REGEX_ALIASES:
+        if rx.search(s):
+            return target
+    return s
+
+def man_eq(cand: str, given: str) -> bool:
+    """Case-sensitive first, fallback to case-insensitive."""
+    return (cand == given) or (cand.upper() == given.upper())
+
+def canonicalize_manufacturer_with_type(man: str, typ: str) -> str:
+    """EC135-era canonicalization to EUROCOPTER; else standard canonicalization."""
+    try:
+        fam = numeric_family(typ)
+    except Exception:
+        fam = None
+    if fam == '135' and harmonize_type_variants(typ).upper().startswith('EC'):
+        return "EUROCOPTER"
+    return canonicalize_manufacturer(man)
+
+# --- Column pickers ----------------------------------------------------------
 
 def pick_column(df: pd.DataFrame, candidates: Iterable[str]) -> str:
     """Pick best-matching column name (case-insensitive on headers)."""
@@ -145,70 +280,62 @@ def pick_column(df: pd.DataFrame, candidates: Iterable[str]) -> str:
     for cand in candidates:
         if cand.lower() in df_cols_lower:
             return df_cols_lower[cand.lower()]
-    # fuzzy fallback
     all_lower = list(df_cols_lower.keys())
     for cand in candidates:
         m = difflib.get_close_matches(cand.lower(), all_lower, n=1, cutoff=0.8)
         if m:
             return df_cols_lower[m[0]]
-    raise ValueError(f"Could not auto-detect any of {list(candidates)}. Available: {list(df.columns)}")
-
+    raise ValueError(
+        f"Could not auto-detect any of {list(candidates)}. Available: {list(df.columns)}"
+    )
 
 def try_pick_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
-    """Best-effort version of pick_column."""
+    """Best-effort version of pick_column: returns None instead of raising."""
     try:
         return pick_column(df, candidates)
     except ValueError:
         return None
 
-
-# ---------------- ICAO/IATA alias & family helpers ---------------------------
+# --- ICAO/IATA alias & code normalization -----------------------------------
 
 def normalize_code_alias(code: str) -> Tuple[str, Set[str]]:
     """
-    Return a canonical key and a set of alias keys for an aircraft type code.
+    Return a canonical key and a set of alias keys for an aircraft type designator.
     - Canonical key removes spaces/hyphens (case preserved).
-    - If pattern is letters? + digits (2-3) + letters? (e.g., 'B763', 'A321', 'B77W'),
-      also include a numeric-only alias (digits + optional trailing letters).
+    - If pattern is letters? + digits (2-3) + letters? (e.g., 'B763', 'A321', 'MD900', 'H900'),
+      DO NOT add pure numeric alias when a letter prefix exists (avoid collisions).
     """
     if not code:
         return "", set()
 
     raw = str(code).strip()
-    key = re.sub(r"[\s\-]+", "", raw)  # remove spaces/hyphens
+    key = re.sub(r"[\s\-]+", "", raw)
 
-    aliases = {key}
+    aliases: Set[str] = {key}
     m = re.match(r"^([A-Za-z]{0,2})(\d{2,3})([A-Za-z]{0,2})$", key)
     if m:
-        num = m.group(2)
-        tail = m.group(3)
+        prefix = m.group(1) or ""
+        num    = m.group(2)
+        tail   = m.group(3) or ""
         if tail:
             aliases.add(num + tail)  # e.g., '77W'
-        else:
-            aliases.add(num)         # e.g., '763'
+        elif not prefix:
+            aliases.add(num)         # pure numeric alias ONLY if there is no alpha prefix
     return key, aliases
-
 
 # --- Engine fallback helper ---------------------------------------------------
 
 def pick_first_engine_for(man: str, typ: str, master: Dict) -> Tuple[str, str]:
     """
-    Return (engine, master_id) for the first suitable (Manufacturer, Type, Engine) combo.
-    Preference order:
-      1) combos from combo_list_valid_code (if ICAO column detected),
-      2) otherwise from combo_list_all.
+    Return (engine_normalized, master_id) for the first suitable (Manufacturer, Type, Engine) combo.
     Deterministic: stable sort by engine string.
     """
-    # Prefer valid-code combos when ICAO is present
     base_pool = master["combo_list_valid_code"] if master.get("type_icao_col") else master["combo_list_all"]
 
-    # Filter to same manufacturer & type (case-sensitive first, case-insensitive fallback via man_eq)
     candidates = [c for c in base_pool if man_eq(c[0], man) and c[1] == typ]
     if not candidates:
-        # As a fallback, allow case-insensitive type match
         candidates = [c for c in base_pool if man_eq(c[0], man) and c[1].upper() == typ.upper()]
 
-    # Deterministic pick: sort by engine name
     candidates.sort(key=lambda c: (str(c[2])))
 
     if candidates:
@@ -216,43 +343,9 @@ def pick_first_engine_for(man: str, typ: str, master: Dict) -> Tuple[str, str]:
         mid = master["lookup"].get((m, t, e), "")
         return e, mid
 
-    # No engine found for the given man+type
     return "", ""
 
-def family_key(t: str) -> str:
-    """
-    Derive a family key from a Type string:
-    - normalize preserving case/hyphen
-    - strip all letters; keep digits and hyphens
-    Examples:
-      'B737-800'   -> '737-800'
-      'B737-800W'  -> '737-800'
-      '737-800BCF' -> '737-800'
-      'A320-214'   -> '320-214'
-    """
-    tn = normalize_preserve_case(t)
-    return re.sub(r"[A-Za-z](?=\d)", "", tn)
-
-
-def is_variant_type(t: str) -> bool:
-    """
-    Returns True if type string includes variant letters (prefix or suffix)
-    beyond the canonical number-hyphen-number pattern.
-    """
-    x = t.replace("-", "")
-    if re.match(r"^[A-Za-z]+\d+", x):  # leading letters
-        return True
-    if re.search(r"[A-Za-z]+$", x) and not x.isdigit():  # trailing letters
-        return True
-    return False
-
-
-def man_eq(cand: str, given: str) -> bool:
-    """Case-sensitive first, fallback to case-insensitive for candidate filtering."""
-    return (cand == given) or (cand.upper() == given.upper())
-
-
-# --- Master path resolution (fixed candidates) --------------------------------
+# --- OneDrive Master path resolution ----------------------------------------
 
 def master_path_candidates() -> List[str]:
     roots = MAC_ONEDRIVE_ROOTS if platform.system() == "Darwin" else WIN_ONEDRIVE_ROOTS
@@ -263,18 +356,14 @@ def master_path_candidates() -> List[str]:
             candidates.append(os.path.join(base, fname))
     return candidates
 
-
 def list_existing_onedrive_roots() -> List[str]:
     roots = MAC_ONEDRIVE_ROOTS if platform.system() == "Darwin" else WIN_ONEDRIVE_ROOTS
     return [r for r in roots if os.path.exists(r)]
 
-
 # --- OneDrive output resolution & save helpers -------------------------------
 
 def resolve_onedrive_output_dir(custom_subdir: Optional[str] = None) -> Optional[str]:
-    """
-    Resolve a writable OneDrive output directory (local only).
-    """
+    """Resolve a writable OneDrive output directory (local only)."""
     roots = list_existing_onedrive_roots()
     if not roots:
         return None
@@ -292,19 +381,14 @@ def resolve_onedrive_output_dir(custom_subdir: Optional[str] = None) -> Optional
     os.makedirs(out_dir, exist_ok=True)
     return os.path.normpath(out_dir)
 
-
 def save_bytes_to_path(buf: io.BytesIO, target_path: str) -> None:
     """Persist a BytesIO to target_path."""
     buf.seek(0)
     with open(target_path, "wb") as f:
         f.write(buf.read())
 
-
 def original_file_stem(filename: Optional[str]) -> str:
-    """
-    Return the original filename stem (without extension).
-    Falls back to 'import' if missing, empty, or extensionless.
-    """
+    """Return the original filename stem (without extension)."""
     try:
         if not filename:
             return "import"
@@ -314,14 +398,10 @@ def original_file_stem(filename: Optional[str]) -> str:
     except Exception:
         return "import"
 
-
 # --- OneDrive Master auto-discovery (local only) -----------------------------
 
 def depth_limited_walk(root: str, max_depth: int):
-    """
-    Yield (dirpath, dirnames, filenames) like os.walk but stop descending after max_depth.
-    Depth is measured as levels below the root.
-    """
+    """Yield (dirpath, dirnames, filenames) like os.walk but stop descending after max_depth."""
     root = os.path.normpath(root)
     root_sep_count = root.count(os.sep)
     for dirpath, dirnames, filenames in os.walk(root):
@@ -329,7 +409,6 @@ def depth_limited_walk(root: str, max_depth: int):
         if depth >= max_depth:
             dirnames[:] = []
         yield dirpath, dirnames, filenames
-
 
 @st.cache_data(show_spinner=False, ttl=300)
 def find_master_in_onedrive_cached(roots: Tuple[str, ...],
@@ -353,7 +432,6 @@ def find_master_in_onedrive_cached(roots: Tuple[str, ...],
                         return matches
     return matches
 
-
 def find_master_candidates_via_auto_search(info, debug,
                                            max_depth: int = DEFAULT_MASTER_SEARCH_DEPTH,
                                            stop_after_first: bool = True) -> List[str]:
@@ -368,6 +446,20 @@ def find_master_candidates_via_auto_search(info, debug,
         debug(f"[AutoSearch] Candidate {i}: {p}")
     return matches
 
+# --- Case-insensitive close matches -----------------------------------------
+
+def get_ci_close_matches(term: str, candidates: list, n: int, cutoff: float) -> list:
+    """Case-insensitive difflib matching; returns original-cased candidates."""
+    t = term.lower()
+    lower_to_orig: Dict[str, str] = {}
+    lows: List[str] = []
+    for c in candidates:
+        lc = c.lower()
+        if lc not in lower_to_orig:
+            lower_to_orig[lc] = c
+            lows.append(lc)
+    picks = difflib.get_close_matches(t, lows, n=n, cutoff=cutoff)
+    return [lower_to_orig[p] for p in picks]
 
 # --- Master loading & lookup building ---------------------------------------
 
@@ -382,7 +474,6 @@ def load_master_from_path(master_path: str, info, debug) -> Dict:
 
     return build_master_lookups(master_df, master_path, info, debug)
 
-
 def load_master_from_buffer(master_buffer, info, debug) -> Dict:
     """Load master file and build lookups from an uploaded file buffer."""
     try:
@@ -393,7 +484,6 @@ def load_master_from_buffer(master_buffer, info, debug) -> Dict:
 
     return build_master_lookups(master_df, "<uploaded master>", info, debug)
 
-
 def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug) -> Dict:
     man_col       = pick_column(master_df, MANUFACTURER_COL_CANDIDATES)
     type_col      = pick_column(master_df, TYPE_COL_CANDIDATES)
@@ -402,20 +492,32 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
     type_icao_col = try_pick_column(master_df, TYPE_ICAO_COL_CANDIDATES)  # optional
     debug(f"Master columns: man={man_col}, type={type_col}, engine={eng_col}, id={id_col}, icao={type_icao_col}")
 
-    master_df["__man__"]    = master_df[man_col].apply(normalize_preserve_case)
-    master_df["__type__"]   = master_df[type_col].apply(normalize_preserve_case)
+    # Normalization & canonicalization (internal keys)
+    master_df["__man__"]    = master_df[man_col].apply(lambda v: canonicalize_manufacturer(normalize_manufacturer_master(v)))
+    master_df["__type__"]   = master_df[type_col].apply(harmonize_type_variants)
     master_df["__engine__"] = master_df[eng_col].apply(normalize_preserve_case)
     master_df["__icao__"]   = master_df[type_icao_col].apply(normalize_preserve_case) if type_icao_col else ""
 
     def is_valid_icao(v: str) -> bool:
         return bool(v) and str(v).strip().upper() != "N/A"
 
+    # Exact lookup (normalized values) and display map to original strings
     lookup: Dict[Tuple[str, str, str], str] = {}
+    lookup_display: Dict[Tuple[str, str, str], Tuple[str, str, str]] = {}
+
     for _, r in master_df.iterrows():
         key = (r["__man__"], r["__type__"], r["__engine__"])
         mid = r[id_col]
         if pd.notna(mid) and key not in lookup:
             lookup[key] = mid
+            lookup_display[key] = (str(r[man_col]), str(r[type_col]), str(r[eng_col]))
+
+    # Case-insensitive exact lookup map
+    lookup_ci: Dict[Tuple[str, str, str], str] = {}
+    for k, mid in lookup.items():
+        k_ci = tuple(str(x).upper() for x in k)
+        if k_ci not in lookup_ci:
+            lookup_ci[k_ci] = mid
 
     man_set  = sorted(set(master_df["__man__"]))
     type_set = sorted(set(master_df["__type__"]))
@@ -423,6 +525,7 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
     info(f"Unique counts — Manufacturers: {len(man_set)}, Types: {len(type_set)}, Engines: {len(eng_set)}")
     info(f"Valid (Manufacturer,Type,Engine) combinations: {len(lookup)}")
 
+    # Build type->ICAO (first non-empty code by type)
     type_to_icao: Dict[str, str] = {}
     valid_code_types: Set[str] = set()
     if type_icao_col:
@@ -434,6 +537,7 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
             if is_valid_icao(code):
                 valid_code_types.add(t)
 
+    # Build ICAO->types map with alias keys (without pure numeric when prefixed)
     icao_to_types: Dict[str, Set[str]] = {}
     if type_icao_col:
         for _, r in master_df.iterrows():
@@ -456,6 +560,8 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
         "man_col": man_col, "type_col": type_col, "eng_col": eng_col, "id_col": id_col,
         "type_icao_col": type_icao_col,
         "lookup": lookup,
+        "lookup_ci": lookup_ci,
+        "lookup_display": lookup_display,  # exact display strings from Master
         "man_set": man_set, "type_set": type_set, "eng_set": eng_set,
         "type_to_icao": type_to_icao,
         "valid_code_types": valid_code_types,
@@ -466,26 +572,59 @@ def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug
         "master_path": master_label,
     }
 
-
 # --- Scoring helpers ---------------------------------------------------------
 
 def score_combos_against(man: str, typ: str, eng: str, combos: list, combo_ids: dict, top_n: int, cutoff: float):
-    """
-    Score given master combos vs the triple using difflib similarity
-    on "Manufacturer Type Engine" (case-sensitive, hyphen-preserving).
-    Returns top matches with ratio >= cutoff: [(ratio, (m,t,e), master_id), ...]
-    """
-    target = f"{man} {typ} {eng}"
+    """Return top matches with ratio >= cutoff: [(ratio, (m,t,e), master_id), ...]"""
+    target = f"{man} {typ} {eng}".lower()
     scored = []
     for combo in combos:
         m, t, e = combo
-        cand = f"{m} {t} {e}"
+        cand = f"{m} {t} {e}".lower()
         ratio = difflib.SequenceMatcher(None, target, cand).ratio()
         if ratio >= cutoff:
             scored.append((ratio, combo, combo_ids[combo]))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_n]
 
+def field_weighted_score(man, typ, eng, cand_m, cand_t, cand_e) -> float:
+    """Weight manufacturer and type higher than engine."""
+    w_man = 0.40
+    w_typ = 0.45
+    w_eng = 0.15
+    return (
+        difflib.SequenceMatcher(None, man.lower(), cand_m.lower()).ratio() * w_man +
+        difflib.SequenceMatcher(None, typ.lower(), cand_t.lower()).ratio() * w_typ +
+        difflib.SequenceMatcher(None, eng.lower(), cand_e.lower()).ratio() * w_eng
+    )
+
+# --- Family & prefix helpers -------------------------------------------------
+
+_DIGIT_FAMILY_RX = re.compile(r'(\d{2,3})')
+
+def family_key(t: str) -> str:
+    tn = harmonize_type_variants(t)
+    m = _DIGIT_FAMILY_RX.search(tn)
+    return m.group(1) if m else ''
+
+def numeric_family(t: str) -> str:
+    tn = harmonize_type_variants(t)
+    m = _DIGIT_FAMILY_RX.search(tn)
+    return m.group(1) if m else ''
+
+def is_variant_type(t: str) -> bool:
+    x = t.replace("-", "")
+    if re.match(r"^[A-Za-z]+\d+", x):
+        return True
+    if re.search(r"[A-Za-z]+$", x) and not x.isdigit():
+        return True
+    return False
+
+def type_prefix(t: str) -> str:
+    tn = harmonize_type_variants(t)
+    x = re.sub(r'[\s\-]+', '', tn)
+    m = re.match(r'^([A-Za-z]+)', x)
+    return m.group(1).upper() if m else ''
 
 # --- Processing core ---------------------------------------------------------
 
@@ -495,9 +634,9 @@ def process_import(
     suggestion_count: int,
     suggestion_cutoff: float,
     info, debug,
-    orig_stem: str,  # original filename stem from uploaded import
+    orig_stem: str,
 ):
-    # Detect import columns (keeps original header & order)
+    # Detect import columns
     info("Detecting Manufacturer/Type/Engine columns in import...")
     try:
         imp_man_col  = pick_column(import_df, MANUFACTURER_COL_CANDIDATES)
@@ -506,19 +645,27 @@ def process_import(
     except ValueError as e:
         raise RuntimeError(f"Error detecting columns in import file: {e}")
     imp_id_col = try_pick_column(import_df, ID_COL_CANDIDATES)
-    debug(f"Import columns: man={imp_man_col}, type={imp_type_col}, engine={imp_eng_col}, id={imp_id_col}")
+
+    # Registration column (first in Validation report)
+    imp_reg_col = try_pick_column(import_df, [
+        "registration", "aircraft registration", "reg", "tail", "tail number"
+    ])
+    debug(f"Registration column detected: {imp_reg_col}")
 
     # Normalize to internal helper columns
     df = import_df.copy()
-    df["__man__"]    = df[imp_man_col].apply(normalize_preserve_case)
-    df["__type__"]   = df[imp_type_col].apply(normalize_preserve_case)
+    df["__type__"]   = df[imp_type_col].apply(harmonize_type_variants)
+    df["__man__"]    = df.apply(lambda r: canonicalize_manufacturer_with_type(
+        normalize_manufacturer_import(r[imp_man_col]),
+        r["__type__"]
+    ), axis=1)
     df["__engine__"] = df[imp_eng_col].apply(normalize_preserve_case)
 
     total          = len(df)
     match_count    = 0
     warn_count     = 0
 
-    validation_rows = []
+    validation_rows: List[Dict[str, str]] = []
     suggested_import = import_df.copy()
 
     info(f"Validating {total} rows...")
@@ -527,78 +674,125 @@ def process_import(
         man_raw  = import_df.at[idx, imp_man_col]
         type_raw = import_df.at[idx, imp_type_col]
         eng_raw  = import_df.at[idx, imp_eng_col]
+        reg_raw  = import_df.at[idx, imp_reg_col] if imp_reg_col else ""
 
-        type_raw_norm = normalize_preserve_case(type_raw)
+        type_raw_norm = harmonize_type_variants(type_raw)
 
         man = row["__man__"]
         typ = row["__type__"]
         eng = row["__engine__"]
 
-        debug(f"[Row {idx}] Raw:   MAN='{man_raw}', TYPE='{type_raw}', ENG='{eng_raw}'")
+        debug(f"[Row {idx}] Raw:   MAN='{man_raw}', TYPE='{type_raw}', ENG='{eng_raw}', REG='{reg_raw}'")
         debug(f"[Row {idx}] Norm:  MAN='{man}', TYPE='{typ}', ENG='{eng}'")
 
         key = (man, typ, eng)
         combo_ok  = key in master["lookup"]
         master_id = master["lookup"].get(key, "")
 
+        # Case-insensitive exact lookup fallback
+        if not combo_ok and master.get("lookup_ci"):
+            key_ci = (man.upper(), typ.upper(), eng.upper())
+            if key_ci in master["lookup_ci"]:
+                combo_ok = True
+                master_id = master["lookup_ci"][key_ci]
+                # Preserve canonical normalized key
+                for k, v in master["lookup"].items():
+                    if v == master_id:
+                        key = k
+                        break
+
         man_ok  = man in master["man_set"]
         type_ok = typ in master["type_set"]
         eng_ok  = eng in master["eng_set"]
 
-        # Field-level suggestions (for report only)
+        # Field-level suggestions (diagnostic only)
         type_universe_for_suggestions = (
             [t for t in master["type_set"] if t in master["valid_code_types"]]
             if master["type_icao_col"] else master["type_set"]
         )
-        man_suggestions  = [] if man_ok  else difflib.get_close_matches(man, master["man_set"],  n=suggestion_count, cutoff=suggestion_cutoff)
-        type_suggestions = [] if type_ok else difflib.get_close_matches(typ, type_universe_for_suggestions, n=suggestion_count, cutoff=suggestion_cutoff)
-        eng_suggestions  = [] if eng_ok  else difflib.get_close_matches(eng, master["eng_set"],  n=suggestion_count, cutoff=suggestion_cutoff)
+        man_suggestions  = [] if man_ok  else get_ci_close_matches(man, master["man_set"],  suggestion_count, suggestion_cutoff)
+        type_suggestions = [] if type_ok else get_ci_close_matches(typ, type_universe_for_suggestions, suggestion_count, suggestion_cutoff)
+        eng_suggestions  = [] if eng_ok  else get_ci_close_matches(eng, master["eng_set"],  suggestion_count, suggestion_cutoff)
 
         # ---------- ICAO/IATA-aware mapping ----------
-        icao_type_suggestions = []
-        icao_combo_hits = []
-        code_key, code_aliases = normalize_code_alias(typ)
-        alias_candidates = ({code_key} | code_aliases) if code_key else set()
+        icao_type_suggestions: List[str] = []
+        icao_combo_hits: List[Tuple[float, Tuple[str, str, str], str]] = []
 
-        mapped_types = set()
         if master["type_icao_col"]:
+            code_val = master["type_to_icao"].get(typ, "")
+            debug(f"[Row {idx}] ICAO designator for type '{typ}': '{code_val}'")
+
+            alias_candidates: Set[str] = set()
+            if code_val:
+                code_key, code_aliases = normalize_code_alias(code_val)
+                alias_candidates = {code_key} | code_aliases
+
             for a in alias_candidates:
-                mapped_types |= master["icao_to_types"].get(a, set())
-        icao_type_suggestions = sorted(mapped_types)
+                icao_type_suggestions.extend(sorted(master["icao_to_types"].get(a, set())))
+
+            if icao_type_suggestions:
+                for t_candidate in set(icao_type_suggestions):
+                    for (m, t, e) in master["combo_list_all"]:
+                        if t == t_candidate:
+                            score = field_weighted_score(man, typ, eng, m, t, e)
+                            icao_combo_hits.append((score, (m, t, e), master["lookup"][(m, t, e)]))
+                icao_combo_hits.sort(key=lambda x: x[0], reverse=True)
+
+        # ---------- FAMILY DETECTION & LOCKING ----------
+        fam_key = numeric_family(type_raw_norm)
+        prefix_raw = type_prefix(type_raw_norm)
+
+        family_types = {t for t in master["type_set"] if numeric_family(t) == fam_key}
+
+        if prefix_raw:
+            family_types = {t for t in family_types if type_prefix(t) == prefix_raw}
 
         if master["type_icao_col"]:
-            for t_candidate in icao_type_suggestions:
-                candidate_combo = (man, t_candidate, eng)
-                if candidate_combo in master["lookup"]:
-                    icao_combo_hits.append((1.0, candidate_combo, master["lookup"][candidate_combo]))
+            family_types_with_code = {t for t in family_types if t in master["valid_code_types"]}
+            if family_types_with_code:
+                family_types = family_types_with_code
 
-        # ---------- FAMILY DETECTION ----------
-        fam_key = family_key(type_raw_norm)
-        family_types = {t for t in master["type_set"] if family_key(t) == fam_key}
-        if master["type_icao_col"]:
-            family_types = {t for t in family_types if t in master["valid_code_types"]}
+        icao_family_num = ''
+        if master["type_icao_col"] and icao_type_suggestions:
+            icao_family_num = numeric_family(icao_type_suggestions[0])
 
         # ---------- Fuzzy scoring sets ----------
-        global_combos = master["combo_list_valid_code"]
+        filtered_combos: List[Tuple[str, str, str]] = []
+        if family_types:
+            filtered_combos = [c for c in master["combo_list_valid_code"] if (c[1] in family_types)]
+            if not filtered_combos:
+                filtered_combos = [c for c in master["combo_list_all"] if (c[1] in family_types)]
+
+        same_manufacturer_combos = [c for c in filtered_combos if man_eq(c[0], man)]
+        if same_manufacturer_combos:
+            filtered_combos = same_manufacturer_combos
+
+        if icao_family_num and filtered_combos:
+            filtered_combos = [c for c in filtered_combos if numeric_family(c[1]) == icao_family_num]
+
+        global_combos = master["combo_list_valid_code"][:]
+        if icao_family_num:
+            global_combos = [c for c in global_combos if numeric_family(c[1]) == icao_family_num]
+        same_manufacturer_global = [c for c in global_combos if man_eq(c[0], man)]
+        if same_manufacturer_global:
+            global_combos = same_manufacturer_global
+
         global_scored = [] if combo_ok else score_combos_against(
             man, typ, eng, global_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
         )
 
-        filtered_combos = [
-            c for c in master["combo_list_valid_code"]
-            if man_eq(c[0], man) and (c[1] in family_types)
-        ] if family_types else []
         filtered_scored = [] if combo_ok else score_combos_against(
-            man, typ, eng, filtered_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
+            man, typ, eng, filtered_combos, master["combo_ids"],
+            top_n=suggestion_count,  # <-- use the integer slider value
+            cutoff=suggestion_cutoff  # <-- keep the float for similarity cutoff
         )
 
         # ---------- Original-type-first ----------
         original_type_hits = []
         if (not combo_ok) and (type_raw_norm in family_types):
-            preferred_type_combos = [
-                c for c in master["combo_list_valid_code"]
-                if man_eq(c[0], man) and (c[1] == type_raw_norm)
-            ]
+            preferred_type_combos = [c for c in master["combo_list_valid_code"] if (c[1] == type_raw_norm)]
+            if not preferred_type_combos:
+                preferred_type_combos = [c for c in master["combo_list_all"] if (c[1] == type_raw_norm)]
             if preferred_type_combos:
                 original_type_hits = score_combos_against(
                     man, typ, eng, preferred_type_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
@@ -609,10 +803,9 @@ def process_import(
         if (not combo_ok) and (not original_type_hits) and family_types:
             base_family_types = [t for t in family_types if not is_variant_type(t)]
             if base_family_types:
-                base_type_combos = [
-                    c for c in master["combo_list_valid_code"]
-                    if man_eq(c[0], man) and (c[1] in base_family_types)
-                ]
+                base_type_combos = [c for c in master["combo_list_valid_code"] if (c[1] in base_family_types)]
+                if not base_type_combos:
+                    base_type_combos = [c for c in master["combo_list_all"] if (c[1] in base_family_types)]
                 if base_type_combos:
                     base_type_hits = score_combos_against(
                         man, typ, eng, base_type_combos, master["combo_ids"], top_n=suggestion_count, cutoff=suggestion_cutoff
@@ -621,17 +814,20 @@ def process_import(
         # ---------- Canonical family preference ----------
         canonical_ranked = []
         if (not combo_ok) and filtered_combos and not original_type_hits and not base_type_hits:
+            target_ci = f"{man} {typ} {eng}".lower()
             for (m, t, e) in filtered_combos:
-                base_score  = difflib.SequenceMatcher(None, f"{man} {typ} {eng}", f"{m} {t} {e}").ratio()
-                shape_score = difflib.SequenceMatcher(None, str(type_raw), t).ratio()
-                penalty     = 0.25 if is_variant_type(t) else 0.0
-                final_score = (base_score * 0.4) + (shape_score * 0.6) - penalty
+                base_score  = difflib.SequenceMatcher(None, target_ci, f"{m} {t} {e}".lower()).ratio()
+                shape_score = difflib.SequenceMatcher(None, str(type_raw_norm).lower(), t.lower()).ratio()
+                penalty_var = 0.25 if is_variant_type(t) else 0.0
+                penalty_family = 0.40 if numeric_family(type_raw_norm) != numeric_family(t) else 0.0
+                man_bonus = 0.05 if man_eq(m, man) else 0.0
+                final_score = (base_score * 0.4) + (shape_score * 0.6) + man_bonus - penalty_var - penalty_family
                 canonical_ranked.append((final_score, (m, t, e), master["lookup"][(m, t, e)]))
             canonical_ranked.sort(reverse=True, key=lambda x: x[0])
 
         # ---------- Choose suggestion ----------
         suggestion_source = ""
-        sug_combo = None
+        sug_combo: Tuple[str, str, str] = key  # default to normalized input
         sug_mid   = ""
 
         if combo_ok:
@@ -648,8 +844,22 @@ def process_import(
                 ratio, sug_combo, sug_mid = base_type_hits[0]
                 suggestion_source = f"base_family_type_preferred(ratio={ratio:.3f})"
             elif icao_combo_hits:
-                _, sug_combo, sug_mid = icao_combo_hits[0]
-                suggestion_source = "icao_exact_combo"
+                score, candidate_combo, candidate_mid = icao_combo_hits[0]
+                if man_eq(candidate_combo[0], man):
+                    sug_combo = candidate_combo
+                    sug_mid   = candidate_mid
+                    suggestion_source = f"icao_weighted(score={score:.3f})"
+                elif canonical_ranked:
+                    ratio, sug_combo, sug_mid = canonical_ranked[0]
+                    suggestion_source = f"canonical_family_choice(score={ratio:.3f})"
+                elif filtered_scored:
+                    ratio, sug_combo, sug_mid = filtered_scored[0]
+                    suggestion_source = f"family_restricted_combo(ratio={ratio:.3f})"
+                elif global_scored:
+                    ratio, sug_combo, sug_mid = global_scored[0]
+                    suggestion_source = f"closest_combo_valid_code_only(ratio={ratio:.3f})"
+                else:
+                    suggestion_source = "none"
             elif canonical_ranked:
                 ratio, sug_combo, sug_mid = canonical_ranked[0]
                 suggestion_source = f"canonical_family_choice(score={ratio:.3f})"
@@ -660,42 +870,51 @@ def process_import(
                 ratio, sug_combo, sug_mid = global_scored[0]
                 suggestion_source = f"closest_combo_valid_code_only(ratio={ratio:.3f})"
             else:
-                sug_combo = key
-                sug_mid   = ""
                 suggestion_source = "none"
 
+        # ---------- FIX C: HARD NUMERIC FAMILY LOCK ----------
+        if suggestion_source != "none":
+            if numeric_family(sug_combo[1]) != numeric_family(type_raw_norm):
+                suggestion_source = "none(family_mismatch)"
+                sug_combo = key
+                sug_mid   = ""
+
         debug(f"[Row {idx}] → Suggestion source: {suggestion_source}")
-        debug(f"[Row {idx}] → Suggested combo: {sug_combo} | MasterID={sug_mid if sug_mid else '—'}")
+        debug(f"[Row {idx}] → Suggested combo (normalized): {sug_combo} | MasterID={sug_mid if sug_mid else '—'}")
 
-        # ---------- Engine-aware writeback (fills missing engine) ----------
-        sug_man, sug_typ, sug_eng = sug_combo
-
-        # Detect missing engine in original import (empty or NaN)
+        # ---------- Engine-aware writeback ----------
+        sug_man_norm, sug_typ_norm, sug_eng_norm = sug_combo
         engine_missing_in_import = (pd.isna(eng_raw) or normalize_preserve_case(eng_raw) == "")
 
-        # If engine was missing, pick the first suitable engine for man+type
-        if engine_missing_in_import:
-            # If we don't already have an engine in the suggested combo, resolve one
-            if not sug_eng or normalize_preserve_case(sug_eng) == "":
-                fallback_eng, fallback_mid = pick_first_engine_for(sug_man, sug_typ, master)
-                if fallback_eng:
-                    sug_eng = fallback_eng
-                    # If we didn't have a MasterID yet or it doesn't match, refresh it
+        if engine_missing_in_import and suggestion_source != "none":
+            if not sug_eng_norm or normalize_preserve_case(sug_eng_norm) == "":
+                fallback_eng_norm, fallback_mid = pick_first_engine_for(sug_man_norm, sug_typ_norm, master)
+                if fallback_eng_norm:
+                    sug_eng_norm = fallback_eng_norm
                     if not sug_mid:
                         sug_mid = fallback_mid
-                else:
-                    # No engine found for man+type; keep empty, MasterID may remain empty too
-                    pass
+                    sug_combo = (sug_man_norm, sug_typ_norm, sug_eng_norm)
 
-        # Write into Suggested Import (preserving original columns/order)
-        suggested_import.at[idx, imp_man_col] = sug_man
-        suggested_import.at[idx, imp_type_col] = sug_typ
-        suggested_import.at[idx, imp_eng_col] = sug_eng
+        # ---------- Write display strings ----------
+        if suggestion_source == "none":
+            sug_man_disp, sug_typ_disp, sug_eng_disp = str(man_raw), str(type_raw), str(eng_raw)
+            sug_mid = ""
+        else:
+            disp = master["lookup_display"].get(sug_combo)
+            if disp:
+                sug_man_disp, sug_typ_disp, sug_eng_disp = disp
+            else:
+                sug_man_disp, sug_typ_disp, sug_eng_disp = sug_man_norm, sug_typ_norm, sug_eng_norm
+
+        suggested_import.at[idx, imp_man_col] = sug_man_disp
+        suggested_import.at[idx, imp_type_col] = sug_typ_disp
+        suggested_import.at[idx, imp_eng_col]  = sug_eng_disp
         if imp_id_col is not None:
-            suggested_import.at[idx, imp_id_col] = sug_mid  # update ID only if present
+            suggested_import.at[idx, imp_id_col] = sug_mid
 
-        # Collect validation row (diagnostics)
+        # ---------- Validation row (Registration FIRST) ----------
         validation_rows.append({
+            "AircraftRegistration": reg_raw,
             "RowIndex": idx,
             "Manufacturer": man_raw,
             "Type": type_raw,
@@ -716,9 +935,9 @@ def process_import(
             "SuggestionsCombo_Global": " | ".join([f"{m} {t} {e}" for _, (m,t,e), _ in global_scored]),
             "SuggestionsComboFromICAO": " | ".join([f"{m} {t} {e}" for _, (m,t,e), _ in icao_combo_hits]),
             "ChosenSuggestionSource": suggestion_source,
-            "ChosenManufacturer": sug_man,
-            "ChosenType": sug_typ,
-            "ChosenEngine": sug_eng,
+            "ChosenManufacturer": sug_man_disp,
+            "ChosenType": sug_typ_disp,
+            "ChosenEngine": sug_eng_disp,
             "ChosenMasterID": sug_mid,
         })
 
@@ -726,28 +945,19 @@ def process_import(
 
     # --- Build outputs in-memory --------------------------------------------
 
-    # 1) Validation report (diagnostics)
-    summary_df = pd.DataFrame([{
-        "Master file used": master["master_path"],
-        "Total rows validated": total,
-        "Successful combination matches": match_count,
-        "Warnings (no combination match)": warn_count,
-        "Type ICAO column detected": bool(master["type_icao_col"]),
-        "Generated at": datetime.now().isoformat(timespec="seconds"),
-    }])
-    report_df  = pd.DataFrame(validation_rows)
+    # Validation report (single sheet only)
+    report_df = pd.DataFrame(validation_rows)
 
-    # Create Excel with hidden columns
     validation_bytes = io.BytesIO()
     with pd.ExcelWriter(validation_bytes, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
         report_df.to_excel(writer, sheet_name="Validation", index=False)
     validation_bytes.seek(0)
 
-    # Hide selected columns using openpyxl
+    # Hide selected columns + RED highlight for unmatched (ChosenMasterID empty/NaN)
     try:
         from openpyxl import load_workbook
         from openpyxl.utils import get_column_letter
+        from openpyxl.styles import PatternFill
 
         wb = load_workbook(validation_bytes)
         ws = wb["Validation"]
@@ -770,19 +980,83 @@ def process_import(
                 col_letter = get_column_letter(name_to_idx[name])
                 ws.column_dimensions[col_letter].hidden = True
 
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        if "ChosenMasterID" in name_to_idx:
+            id_col_idx = name_to_idx["ChosenMasterID"]
+            for row_idx in range(2, ws.max_row + 1):
+                val = ws.cell(row=row_idx, column=id_col_idx).value
+                if val in ("", None, "—") or (isinstance(val, str) and val.strip().lower() in ("nan", "none", "null")):
+                    for col_idx in range(1, ws.max_column + 1):
+                        ws.cell(row=row_idx, column=col_idx).fill = red_fill
+
         out_validation = io.BytesIO()
         wb.save(out_validation)
         out_validation.seek(0)
     except Exception:
         out_validation = validation_bytes
 
-    # 2) Suggested Import (keeps exact original header order & structure)
+    # --- Suggested Import (keeps exact original header order & structure)
+    # Uppercase Manufacturer ONLY for the export (SuggestedImport)
+    export_suggested = suggested_import.copy()
+    export_suggested[imp_man_col] = export_suggested[imp_man_col].apply(
+        lambda v: (str(v).upper() if pd.notna(v) else v)
+    )
+
     out_suggested = io.BytesIO()
     with pd.ExcelWriter(out_suggested, engine="openpyxl") as writer:
-        suggested_import.to_excel(writer, sheet_name="SuggestedImport", index=False)
+        export_suggested.to_excel(writer, sheet_name="SuggestedImport", index=False)
     out_suggested.seek(0)
 
-    # Filenames derived from original uploaded file name (stem)
+    # RED highlight in SuggestedImport based on exact Master DISPLAY values only
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import PatternFill
+
+        wb2 = load_workbook(out_suggested)
+        ws2 = wb2["SuggestedImport"]
+
+        headers = [cell.value for cell in ws2[1]]
+
+        def find_col_index(name: str) -> Optional[int]:
+            for i, h in enumerate(headers):
+                if isinstance(h, str) and h.strip().lower() == str(name).strip().lower():
+                    return i + 1
+            return None
+
+        man_col_idx = find_col_index("Manufacturer")      or find_col_index(imp_man_col)
+        typ_col_idx = find_col_index("Aircraft Type")     or find_col_index(imp_type_col)
+        eng_col_idx = find_col_index("Engine Type")       or find_col_index(imp_eng_col)
+
+        valid_master_display_keys_upper: Set[Tuple[str, str, str]] = set(
+            (str(m).upper(), str(t), str(e))
+            for (m, t, e) in master["lookup_display"].values()
+        )
+
+        if man_col_idx and typ_col_idx and eng_col_idx:
+            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+            for row_idx in range(2, ws2.max_row + 1):
+                man_disp = ws2.cell(row=row_idx, column=man_col_idx).value
+                typ_disp = ws2.cell(row=row_idx, column=typ_col_idx).value
+                eng_disp = ws2.cell(row=row_idx, column=eng_col_idx).value
+
+                disp_tuple_upper_man = (
+                    (str(man_disp).upper() if man_disp is not None else ""),
+                    (str(typ_disp) if typ_disp is not None else ""),
+                    (str(eng_disp) if eng_disp is not None else "")
+                )
+
+                if disp_tuple_upper_man not in valid_master_display_keys_upper:
+                    for col_idx in range(1, ws2.max_column + 1):
+                        ws2.cell(row=row_idx, column=col_idx).fill = red_fill
+
+        styled_suggested = io.BytesIO()
+        wb2.save(styled_suggested)
+        styled_suggested.seek(0)
+        out_suggested = styled_suggested
+    except Exception:
+        pass
+
     sugg_name = f"{orig_stem}_import_ready.xlsx"
     report_name = f"{orig_stem}_validation_report.xlsx"
 
@@ -794,27 +1068,22 @@ def process_import(
         "sugg_name": sugg_name,
     }
 
-    return out_validation, out_suggested, metrics, summary_df, report_df, suggested_import
-
+    return out_validation, out_suggested, metrics, report_df, suggested_import
 
 # ---------------------- Cloud detection --------------------------------------
 
 def running_in_cloud() -> bool:
-    """
-    Lightweight detection for Streamlit Cloud. If environment can't see any OneDrive roots,
-    treat as cloud, or rely on Streamlit runtime hints if available.
-    """
+    """Lightweight detection for Streamlit Cloud / missing OneDrive roots."""
     runtime_hint = os.getenv("STREAMLIT_RUNTIME", "")
     server_enabled = os.getenv("STREAMLIT_SERVER_ENABLED") == "1"
     no_onedrive_roots = len(list_existing_onedrive_roots()) == 0
     return server_enabled or runtime_hint.startswith("streamlit") or no_onedrive_roots
 
-
 # ---------------------- UI LAYOUT -------------------------------------------
 
 st.title("🛫 SafetyManager365")
 st.subheader("Aircraft Import Validator & Suggester")
-st.caption("Ruben Inion v0.3")
+st.caption("Ruben Inion v0.4.8")
 
 with st.sidebar:
     st.header("Settings")
@@ -826,12 +1095,19 @@ with st.sidebar:
     st.subheader("Master source")
     master_upload = st.file_uploader("Upload Master Excel (.xlsx) (overrides everything)", type=["xlsx"])
     auto_search_master = st.checkbox("Local: Auto-search Master across OneDrive (fallback)", value=True)
-    max_search_depth = st.slider("Auto-search depth", min_value=2, max_value=12, value=DEFAULT_MASTER_SEARCH_DEPTH, step=1,
-                                 help="Limits recursion when scanning your OneDrive to find the Master file.")
+    max_search_depth = st.slider(
+        "Auto-search depth", min_value=2, max_value=12,
+        value=DEFAULT_MASTER_SEARCH_DEPTH, step=1,
+        help="Limits recursion when scanning your OneDrive to find the Master file."
+    )
 
     st.divider()
     st.subheader("Output")
-    save_to_onedrive = st.checkbox("Local: Save to OneDrive", value=False, help="Save output files to your OneDrive (local only)")
+    save_to_onedrive = st.checkbox(
+        "Local: Save to OneDrive",
+        value=False,
+        help="Save output files to your OneDrive (local only)"
+    )
     onedrive_subfolder = st.text_input(
         "OneDrive subfolder (optional)",
         value=PROJECT_FOLDER,
@@ -843,7 +1119,6 @@ info, debug, flush_logs = get_logger(verbose)
 col1, col2 = st.columns(2)
 with col1:
     import_upload = st.file_uploader("Upload Import Excel (.xlsx)", type=["xlsx"])
-
 with col2:
     st.markdown("**Master source status**")
     master_source_placeholder = st.empty()
@@ -855,10 +1130,7 @@ master_dict: Optional[Dict] = None
 master_status_lines: List[str] = []
 
 cloud = running_in_cloud()
-if cloud:
-    master_status_lines.append("Cloud mode detected.")
-else:
-    master_status_lines.append("Local mode detected.")
+master_status_lines.append("Cloud mode detected." if cloud else "Local mode detected.")
 
 if master_upload is not None:
     try:
@@ -868,7 +1140,6 @@ if master_upload is not None:
         st.error(f"Failed to load uploaded Master: {e}")
 else:
     if cloud:
-        # Streamlit Cloud: use the repo-bundled Master if present
         if os.path.exists(REPO_MASTER_FALLBACK):
             try:
                 master_dict = load_master_from_path(REPO_MASTER_FALLBACK, info, debug)
@@ -879,16 +1150,11 @@ else:
         else:
             master_status_lines.append("Repo-bundled Master not found. Please upload the Master in the sidebar.")
     else:
-        # Local: try fixed paths first
         candidates = master_path_candidates()
         existing = [p for p in candidates if os.path.exists(p)]
-
-        # Show candidates + existence in status
-        master_status_lines.append("Fixed-path candidates (local):")
-        for p in candidates:
-            master_status_lines.append(f"- {p} {'✅' if os.path.exists(p) else '❌'}")
-
         if existing:
+            master_status_lines.append("Fixed-path Master (local):")
+            master_status_lines.append(f"- {existing[0]}")
             try:
                 master_dict = load_master_from_path(existing[0], info, debug)
                 master_status_lines.append(f"Master auto-detected (fixed path): `{existing[0]}`")
@@ -896,7 +1162,6 @@ else:
                 st.error(f"Failed to read detected Master: {e}")
         else:
             master_status_lines.append("No fixed-path OneDrive Master found.")
-            # Auto-search (fallback)
             if auto_search_master:
                 matches = find_master_candidates_via_auto_search(info, debug, max_depth=max_search_depth, stop_after_first=True)
                 if matches:
@@ -906,9 +1171,9 @@ else:
                     except Exception as e:
                         st.error(f"Failed to read auto-searched Master: {e}")
                 else:
-                    master_status_lines.append("Auto-search did not find a Master file. You can upload a Master file in the sidebar.")
+                    master_status_lines.append("Auto-search did not find a Master file. You can upload the Master in the sidebar.")
             else:
-                master_status_lines.append("Auto-search disabled. You can upload a Master file in the sidebar.")
+                master_status_lines.append("Auto-search disabled. You can upload the Master in the sidebar.")
 
 master_source_placeholder.markdown("\n\n".join(master_status_lines))
 
@@ -921,10 +1186,9 @@ if run_btn and import_upload is not None:
         if master_dict is None:
             st.error("Master dataset is not available. Please upload a Master file.")
         else:
-            # Derive stem from uploaded filename
             import_stem = original_file_stem(getattr(import_upload, "name", None))
 
-            out_validation, out_suggested, metrics, summary_df, report_df, suggested_import = process_import(
+            out_validation, out_suggested, metrics, report_df, suggested_import = process_import(
                 import_df=import_df,
                 master=master_dict,
                 suggestion_count=suggestion_count,
@@ -946,7 +1210,6 @@ if run_btn and import_upload is not None:
                     try:
                         save_bytes_to_path(out_suggested, sugg_path)
                         save_bytes_to_path(out_validation, report_path)
-                        # Rewind buffers for subsequent download buttons
                         out_suggested.seek(0)
                         out_validation.seek(0)
                         st.success(f"Saved to OneDrive:\n- {sugg_path}\n- {report_path}")
@@ -958,16 +1221,19 @@ if run_btn and import_upload is not None:
 
             # Metrics
             st.success("Processing complete.")
+
+            # Count rows with missing ChosenMasterID
+            unable_to_import = report_df["ChosenMasterID"].isna().sum() + \
+                               (report_df["ChosenMasterID"].astype(str).str.strip().isin(
+                                   ["", "nan", "None", "null", "—"])).sum()
+
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Rows validated", metrics["total"])
             m2.metric("Exact matches", metrics["matches"])
             m3.metric("Warnings", metrics["warnings"])
-            m4.metric("ICAO column detected", "Yes" if bool(master_dict["type_icao_col"]) else "No")
+            m4.metric("Unable to Import", unable_to_import)
 
             # Previews
-            st.subheader("Summary")
-            st.dataframe(summary_df, use_container_width=True)
-
             st.subheader("Validation preview")
             st.dataframe(report_df.head(50), use_container_width=True)
 
@@ -994,19 +1260,14 @@ if run_btn and import_upload is not None:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # New: ZIP download with both files at once
             with cdl3:
-                # Ensure buffers are rewound before zipping
                 out_validation.seek(0)
                 out_suggested.seek(0)
 
                 zip_buf = io.BytesIO()
                 with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    # Write both Excel buffers to the ZIP with the desired filenames
                     zf.writestr(metrics["report_name"], out_validation.read())
-                    # Reset to start again since we've read the buffer
                     out_validation.seek(0)
-
                     zf.writestr(metrics["sugg_name"], out_suggested.read())
                     out_suggested.seek(0)
 
@@ -1019,7 +1280,6 @@ if run_btn and import_upload is not None:
                     mime="application/zip",
                     help="Downloads both the validation report and the suggested import together.",
                 )
-
 
     except Exception as e:
         st.error(f"Processing failed: {e}")
