@@ -14,6 +14,9 @@ This build:
 - Bell Textron normalization additions (locale token 'Canada', explicit aliases, broad regex).
 - Marking in SuggestedImport uses exact Master display strings only (no normalization).
 - Validation report contains AircraftRegistration as first column; no Summary sheet.
+
+Additions in this version:
+- MTOW sanitization in SuggestedImport: strip everything except digits in the MTOW column.
 """
 
 import io
@@ -22,7 +25,6 @@ import re
 import difflib
 import platform
 import zipfile
-from datetime import datetime
 from typing import Optional, Tuple, Set, Dict, List, Iterable
 
 import pandas as pd
@@ -103,6 +105,13 @@ TYPE_ICAO_COL_CANDIDATES    = [
     "type designator", "icao aircraft type", "icao model"
 ]
 
+# --- NEW: MTOW candidates (case-insensitive) ---------------------------------
+MTOW_COL_CANDIDATES = [
+    "mtow", "mtow (kg)", "maximum takeoff weight", "maximum take-off weight",
+    "max takeoff weight", "max take-off weight", "mtow kg", "mtow (t)",
+    "mtow (lbs)", "mtow lbs",
+]
+
 # Defaults
 DEFAULT_SUGGESTION_COUNT   = 3
 DEFAULT_SUGGESTION_CUTOFF  = 0.60
@@ -154,9 +163,6 @@ def normalize_type(value) -> str:
     - preserve case/hyphens
     - remove letter<->digit spaces
     - compact '+' / 'PLUS'
-    Examples:
-      'EC 135 P2 +' -> 'EC135 P2+'
-      'EC135 P2 PLUS' -> 'EC135 P2+'
     """
     s = normalize_preserve_case(value)
     for pat, repl in TYPE_SPACE_FIXES:
@@ -168,10 +174,7 @@ def normalize_type(value) -> str:
 # --- Variant synonym harmonization ------------------------------------------
 
 TYPE_SYNONYMS: Dict[str, str] = {
-    # Example: EC135 T2+ -> EC135 T2 Series (uncomment if your Master uses 'Series')
-    # "EC135 T2+": "EC135 T2 Series",
-    # "EC135 P2+": "EC135 P2 Series",
-    # "A320 NEO": "A320-251N",
+    # e.g., "EC135 T2+": "EC135 T2 Series",
     # "320N": "A320-251N",
 }
 
@@ -371,7 +374,7 @@ def resolve_onedrive_output_dir(custom_subdir: Optional[str] = None) -> Optional
     base_root = roots[0]
     if custom_subdir:
         sub = sanitize_path(custom_subdir)
-        if os.path.isabs(sub) and sub.startswith(base_root):
+        if os.path.isabs(sub) and os.path.commonpath([base_root]) == os.path.commonpath([base_root, sub]):
             out_dir = sub
         else:
             out_dir = os.path.join(base_root, sub)
@@ -783,8 +786,8 @@ def process_import(
 
         filtered_scored = [] if combo_ok else score_combos_against(
             man, typ, eng, filtered_combos, master["combo_ids"],
-            top_n=suggestion_count,  # <-- use the integer slider value
-            cutoff=suggestion_cutoff  # <-- keep the float for similarity cutoff
+            top_n=suggestion_count,
+            cutoff=suggestion_cutoff
         )
 
         # ---------- Original-type-first ----------
@@ -1001,6 +1004,16 @@ def process_import(
     export_suggested[imp_man_col] = export_suggested[imp_man_col].apply(
         lambda v: (str(v).upper() if pd.notna(v) else v)
     )
+
+    # --- NEW: MTOW digits-only sanitization for SuggestedImport --------------
+    mtow_col = try_pick_column(export_suggested, MTOW_COL_CANDIDATES)
+    if mtow_col:
+        def digits_only(v):
+            if pd.isna(v):
+                return v
+            s = re.sub(r'[^0-9]', '', str(v))
+            return s if s != "" else ""
+        export_suggested[mtow_col] = export_suggested[mtow_col].apply(digits_only)
 
     out_suggested = io.BytesIO()
     with pd.ExcelWriter(out_suggested, engine="openpyxl") as writer:
@@ -1237,8 +1250,21 @@ if run_btn and import_upload is not None:
             st.subheader("Validation preview")
             st.dataframe(report_df.head(50), use_container_width=True)
 
-            st.subheader("Suggested Import preview")
-            st.dataframe(suggested_import.head(50), use_container_width=True)
+            # ---------------------- Preview (Modified Suggested Import) ----------------------
+            st.subheader("Import ready preview")
+
+            try:
+                # Reset pointer and load the cleaned SuggestedImport output
+                out_suggested.seek(0)
+                preview_df = pd.read_excel(
+                    out_suggested,
+                    engine="openpyxl",
+                    sheet_name="SuggestedImport"
+                )
+                st.dataframe(preview_df.head(50), use_container_width=True)
+
+            except Exception as e:
+                st.warning(f"Unable to render the Import_ready preview: {e}")
 
             # ---------------------- Downloads --------------------------------------------
             st.subheader("Downloads")
