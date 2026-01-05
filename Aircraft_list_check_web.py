@@ -3,20 +3,14 @@
 # -*- coding: utf-8 -*-
 
 """
-SafetyManager365 — Aircraft Import Validator & Suggester
+SafetyManager365 — Aircraft Import Validator & Suggester (v0.5.3, DH8x patch)
 
-This build:
-- REMOVES Fix A (manufacturer hard guard). Manufacturer presence in Master does NOT block suggestions.
-- KEEPS Fix C (numeric family hard lock): reject any suggestion whose family != original family.
-- Exact Master display strings written back to SuggestedImport (spacing/casing preserved).
-- Prevent cross-platform collisions via ICAO alias guard and type prefix family restriction.
-- Prefer same-manufacturer candidates; ICAO suggestions require manufacturer equality.
-- Bell Textron normalization additions (locale token 'Canada', explicit aliases, broad regex).
-- Marking in SuggestedImport uses exact Master display strings only (no normalization).
-- Validation report contains AircraftRegistration as first column; no Summary sheet.
-
-Additions in this version:
-- MTOW sanitization in SuggestedImport: strip everything except digits in the MTOW column.
+Key fixes:
+- ICAO suggestions seeded from the import token (e.g., DH8C) so DH8x always maps to DHC-8-xxx types.
+- Manufacturer canonicalization: DE HAVILLAND -> DE HAVILLAND CANADA (Master uses De Havilland Canada, not Bombardier).
+- Treat generic engines (Turboprop/Jet/Piston...) as "missing" -> fallback to first valid engine model from Master.
+- Dash-8 family special case: DH8*/DHC-8-xxx considered same family ('8') to retain candidates.
+- Cleaned minor issues in earlier snippet (regex alias struct, function signatures, etc.).
 """
 
 import io
@@ -102,10 +96,10 @@ ID_COL_CANDIDATES           = ["id", "aircraft id", "aircraft_id", "uid", "key",
 # Optional ICAO/IATA type designator column candidates (case-insensitive)
 TYPE_ICAO_COL_CANDIDATES    = [
     "icao", "icao type", "icao code", "icao designator", "icao type designator",
-    "type designator", "icao aircraft type", "icao model"
+    "type designator", "icao aircraft type", "icao model", "iata"  # tolerate IATA column too
 ]
 
-# --- NEW: MTOW candidates (case-insensitive) ---------------------------------
+# MTOW column candidates (case-insensitive)
 MTOW_COL_CANDIDATES = [
     "mtow", "mtow (kg)", "maximum takeoff weight", "maximum take-off weight",
     "max takeoff weight", "max take-off weight", "mtow kg", "mtow (t)",
@@ -133,37 +127,35 @@ def normalize_preserve_case(value) -> str:
     """
     Normalize while preserving case and hyphens:
     - Trim whitespace
-    - Unify EN/EM dash to '-' and tighten spaces around hyphens ("737 - 700" -> "737-700")
+    - Unify EN/EM dash to '-' and tighten spaces around hyphens
     - Collapse remaining spaces
     - DO NOT lowercase
     """
     if pd.isna(value):
         return ""
     s = str(value).strip()
-    s = s.replace("–", "-").replace("—", "-")  # unify dashes
-    s = re.sub(r"\s*-\s*", "-", s)            # tighten hyphens
-    s = re.sub(r"\s+", " ", s)                # collapse spaces
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s*-\s*", "-", s)
+    s = re.sub(r"\s+", " ", s)
     return s
 
 # --- Type-specific normalization --------------------------------------------
 
 TYPE_SPACE_FIXES = [
-    (r'(?<=\b[A-Za-z])\s+(?=\d)', ''),    # 'R 44' -> 'R44', 'EC 135' -> 'EC135'
-    (r'(?<=\d)\s+(?=[A-Za-z])', ''),      # '44 II' -> '44II', '135 T2 +' -> '135T2 +'
+    (r'(?<=\b[A-Za-z])\s+(?=\d)', ''),    # 'EC 135' -> 'EC135'
+    (r'(?<=\d)\s+(?=[A-Za-z])', ''),      # '135 T2 +' -> '135T2 +'
 ]
 
+
+# DO NOT remove the + sign — keep C680+ distinct from C680
 TYPE_VARIANT_FIXES = [
-    (r'\s*\+\s*', '+'),                   # compact plus
-    (r'\bPLUS\b', '+'),                   # 'PLUS' -> '+'
+    (r'\bPLUS\b', '+'),  # convert the word "PLUS" to '+'
+    # Remove the rule that strips/mangles '+'
 ]
+
 
 def normalize_type(value) -> str:
-    """
-    Type-specific normalization:
-    - preserve case/hyphens
-    - remove letter<->digit spaces
-    - compact '+' / 'PLUS'
-    """
+    """Type-specific normalization keeping case/hyphens and compaction."""
     s = normalize_preserve_case(value)
     for pat, repl in TYPE_SPACE_FIXES:
         s = re.sub(pat, repl, s)
@@ -171,25 +163,41 @@ def normalize_type(value) -> str:
         s = re.sub(pat, repl, s, flags=re.IGNORECASE)
     return s
 
-# --- Variant synonym harmonization ------------------------------------------
+# --- Dash‑8 ICAO normalizer (hard) ------------------------------------------
+def normalize_dash8_icao(t: str) -> str:
+    """
+    Cleanup for Dash-8 ICAO types (DH8A/DH8B/DH8C/DH8D).
+    Removes spaces/thin spaces, uppercases, truncates to canonical 4-char token.
+    """
+    if t is None or (isinstance(t, float) and pd.isna(t)):
+        return ""
+    s = str(t)
+    s = s.replace("\u2009", "").replace("\u202F", "").replace(" ", "")
+    s = s.upper().strip()
+    if s.startswith("DH8") and len(s) >= 4:
+        return s[:4]
+    return s
 
+# --- Variant synonym harmonization ------------------------------------------
 TYPE_SYNONYMS: Dict[str, str] = {
-    # e.g., "EC135 T2+": "EC135 T2 Series",
-    # "320N": "A320-251N",
+    # e.g., "DHC-8-300 DASH 8": "DHC-8-300",  # optional helper for scoring; writeback uses Master displays
 }
 
 def harmonize_type_variants(t: str) -> str:
-    """Normalize then apply synonym mapping to align to Master canonical tokens."""
+    """Normalize then apply synonym mapping, plus Dash‑8 ICAO normalization."""
     nt = normalize_type(t)
-    canon = TYPE_SYNONYMS.get(nt)
+    nt = normalize_dash8_icao(nt)
+    canon_key_upper = TYPE_SYNONYMS.get(nt.upper())
+    canon_key_case  = TYPE_SYNONYMS.get(nt)
+    canon = canon_key_upper if canon_key_upper is not None else canon_key_case
     return normalize_type(canon) if canon else nt
 
 # --- Manufacturer normalization & aliasing ----------------------------------
 
 def clean_dangling_punct(s: str) -> str:
     """Remove stray trailing/leading punctuation and compress spaces."""
-    s = re.sub(r"\s*[,.;:]\s*$", "", s)     # trailing , . ; :
-    s = re.sub(r"^\s*[,.;:]\s*", "", s)     # leading , . ; :
+    s = re.sub(r"\s*[,.;:]\s*$", "", s)
+    s = re.sub(r"^\s*[,.;:]\s*", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -239,6 +247,12 @@ MANUFACTURER_ALIASES: Dict[str, str] = {
     "BELL TEXTRON CANADA": "BELL",
     "BELL TEXTRON CANADA LTD": "BELL",
     "BELL TEXTRON INC": "BELL",
+
+    # De Havilland canonicalization (Master uses DE HAVILLAND CANADA)
+    "DE HAVILLAND": "DE HAVILLAND CANADA",
+    "DE HAVILLAND CANADA": "DE HAVILLAND CANADA",
+    "DE HAVILLAND AIRCRAFT OF CANADA": "DE HAVILLAND CANADA",
+    "DE HAVILLAND AIRCRAFT OF CANADA LIMITED": "DE HAVILLAND CANADA",
 }
 
 MANUFACTURER_REGEX_ALIASES: List[Tuple[re.Pattern, str]] = [
@@ -268,10 +282,10 @@ def man_eq(cand: str, given: str) -> bool:
 def canonicalize_manufacturer_with_type(man: str, typ: str) -> str:
     """EC135-era canonicalization to EUROCOPTER; else standard canonicalization."""
     try:
-        fam = numeric_family(typ)
+        fam = re.search(r'(\d{2,3})', harmonize_type_variants(typ)).group(1)
     except Exception:
         fam = None
-    if fam == '135' and harmonize_type_variants(typ).upper().startswith('EC'):
+    if fam == '135' and str(harmonize_type_variants(typ)).upper().startswith('EC'):
         return "EUROCOPTER"
     return canonicalize_manufacturer(man)
 
@@ -374,7 +388,7 @@ def resolve_onedrive_output_dir(custom_subdir: Optional[str] = None) -> Optional
     base_root = roots[0]
     if custom_subdir:
         sub = sanitize_path(custom_subdir)
-        if os.path.isabs(sub) and os.path.commonpath([base_root]) == os.path.commonpath([base_root, sub]):
+        if os.path.isabs(sub) and sub.startswith(base_root):
             out_dir = sub
         else:
             out_dir = os.path.join(base_root, sub)
@@ -487,93 +501,130 @@ def load_master_from_buffer(master_buffer, info, debug) -> Dict:
 
     return build_master_lookups(master_df, "<uploaded master>", info, debug)
 
+
 def build_master_lookups(master_df: pd.DataFrame, master_label: str, info, debug) -> Dict:
+    """
+    Clean, corrected Master lookup builder.
+    FIXES:
+      - ICAO mapping now uses ICAO column as key source (correct for C680 etc.)
+      - valid_code_types correctly tracks which TYPEs have ICAO codes
+      - icao_to_types maps ICAO → set(types)
+      - type_to_icao maps TYPE → ICAO
+    """
+
+    # ---- Column detection ---------------------------------------------------
     man_col       = pick_column(master_df, MANUFACTURER_COL_CANDIDATES)
     type_col      = pick_column(master_df, TYPE_COL_CANDIDATES)
     eng_col       = pick_column(master_df, ENGINE_COL_CANDIDATES)
     id_col        = pick_column(master_df, ID_COL_CANDIDATES)
-    type_icao_col = try_pick_column(master_df, TYPE_ICAO_COL_CANDIDATES)  # optional
+    type_icao_col = try_pick_column(master_df, TYPE_ICAO_COL_CANDIDATES)
+
     debug(f"Master columns: man={man_col}, type={type_col}, engine={eng_col}, id={id_col}, icao={type_icao_col}")
 
-    # Normalization & canonicalization (internal keys)
+    # ---- Normalization ------------------------------------------------------
     master_df["__man__"]    = master_df[man_col].apply(lambda v: canonicalize_manufacturer(normalize_manufacturer_master(v)))
     master_df["__type__"]   = master_df[type_col].apply(harmonize_type_variants)
     master_df["__engine__"] = master_df[eng_col].apply(normalize_preserve_case)
-    master_df["__icao__"]   = master_df[type_icao_col].apply(normalize_preserve_case) if type_icao_col else ""
+
+    if type_icao_col:
+        master_df["__icao__"] = master_df[type_icao_col].apply(lambda v: str(v).strip().upper())
+    else:
+        master_df["__icao__"] = ""
 
     def is_valid_icao(v: str) -> bool:
-        return bool(v) and str(v).strip().upper() != "N/A"
+        return bool(v) and v not in ("N/A", "NONE", "NULL")
 
-    # Exact lookup (normalized values) and display map to original strings
+    # ---- Build EXACT lookup (M,T,E → ID) -----------------------------------
     lookup: Dict[Tuple[str, str, str], str] = {}
     lookup_display: Dict[Tuple[str, str, str], Tuple[str, str, str]] = {}
 
     for _, r in master_df.iterrows():
         key = (r["__man__"], r["__type__"], r["__engine__"])
         mid = r[id_col]
+
         if pd.notna(mid) and key not in lookup:
             lookup[key] = mid
-            lookup_display[key] = (str(r[man_col]), str(r[type_col]), str(r[eng_col]))
+            lookup_display[key] = (
+                str(r[man_col]),
+                str(r[type_col]),
+                str(r[eng_col])
+            )
 
-    # Case-insensitive exact lookup map
+    # ---- Case‑insensitive lookup -------------------------------------------
     lookup_ci: Dict[Tuple[str, str, str], str] = {}
     for k, mid in lookup.items():
         k_ci = tuple(str(x).upper() for x in k)
         if k_ci not in lookup_ci:
             lookup_ci[k_ci] = mid
 
+    # ---- Sets of unique fields ---------------------------------------------
     man_set  = sorted(set(master_df["__man__"]))
     type_set = sorted(set(master_df["__type__"]))
     eng_set  = sorted(set(master_df["__engine__"]))
+
     info(f"Unique counts — Manufacturers: {len(man_set)}, Types: {len(type_set)}, Engines: {len(eng_set)}")
     info(f"Valid (Manufacturer,Type,Engine) combinations: {len(lookup)}")
 
-    # Build type->ICAO (first non-empty code by type)
-    type_to_icao: Dict[str, str] = {}
-    valid_code_types: Set[str] = set()
+    # ---- ICAO mappings ------------------------------------------------------
+    type_to_icao: Dict[str, str] = {}         # TYPE → ICAO
+    icao_to_types: Dict[str, Set[str]] = {}   # ICAO → {TYPE}
+    valid_code_types: Set[str] = set()        # TYPEs that have valid ICAO codes
+
     if type_icao_col:
         for _, r in master_df.iterrows():
-            t = r["__type__"]
-            code = r["__icao__"]
-            if t not in type_to_icao and code != "":
-                type_to_icao[t] = code
-            if is_valid_icao(code):
-                valid_code_types.add(t)
+            icao = r["__icao__"]
+            typ  = r["__type__"]
 
-    # Build ICAO->types map with alias keys (without pure numeric when prefixed)
-    icao_to_types: Dict[str, Set[str]] = {}
-    if type_icao_col:
-        for _, r in master_df.iterrows():
-            icao_raw = r["__icao__"]
-            tval     = r["__type__"]
-            if not is_valid_icao(icao_raw):
-                continue
-            key, aliases = normalize_code_alias(icao_raw)
-            for a in ({key} | aliases):
-                icao_to_types.setdefault(a, set()).add(tval)
-        debug(f"ICAO map keys loaded: {len(icao_to_types)}")
+            if is_valid_icao(icao):
+                # TYPE → ICAO mapping
+                type_to_icao[typ] = icao
 
+                # ICAO → TYPE mapping
+                icao_to_types.setdefault(icao, set()).add(typ)
+
+                # TYPE is ICAO-supported
+                valid_code_types.add(typ)
+
+        debug(f"Loaded ICAO→types keys: {len(icao_to_types)}")
+        debug(f"TYPEs with valid ICAO: {len(valid_code_types)}")
+
+    # ---- Build combination lists -------------------------------------------
     combo_list_all = list(lookup.keys())
-    combo_list_valid_code = [c for c in combo_list_all if c[1] in valid_code_types] if type_icao_col else combo_list_all[:]
 
-    debug(f"Combos (all): {len(combo_list_all)}, combos (valid code only): {len(combo_list_valid_code)}")
+    if type_icao_col:
+        combo_list_valid_code = [c for c in combo_list_all if c[1] in valid_code_types]
+    else:
+        combo_list_valid_code = combo_list_all[:]
+
+    # ---- Done ---------------------------------------------------------------
+    debug(f"Combos (all): {len(combo_list_all)}, combos (valid ICAO only): {len(combo_list_valid_code)}")
 
     return {
         "df": master_df,
-        "man_col": man_col, "type_col": type_col, "eng_col": eng_col, "id_col": id_col,
+        "man_col": man_col,
+        "type_col": type_col,
+        "eng_col": eng_col,
+        "id_col": id_col,
         "type_icao_col": type_icao_col,
+
         "lookup": lookup,
         "lookup_ci": lookup_ci,
-        "lookup_display": lookup_display,  # exact display strings from Master
-        "man_set": man_set, "type_set": type_set, "eng_set": eng_set,
+        "lookup_display": lookup_display,
+
+        "man_set": man_set,
+        "type_set": type_set,
+        "eng_set": eng_set,
+
         "type_to_icao": type_to_icao,
-        "valid_code_types": valid_code_types,
         "icao_to_types": icao_to_types,
+        "valid_code_types": valid_code_types,
+
         "combo_list_all": combo_list_all,
         "combo_list_valid_code": combo_list_valid_code,
         "combo_ids": lookup,
         "master_path": master_label,
     }
+
 
 # --- Scoring helpers ---------------------------------------------------------
 
@@ -603,7 +654,7 @@ def field_weighted_score(man, typ, eng, cand_m, cand_t, cand_e) -> float:
 
 # --- Family & prefix helpers -------------------------------------------------
 
-_DIGIT_FAMILY_RX = re.compile(r'(\d{2,3})')
+_DIGIT_FAMILY_RX = re.compile(r'(\d{2,3})')  # variant-level by default
 
 def family_key(t: str) -> str:
     tn = harmonize_type_variants(t)
@@ -612,11 +663,14 @@ def family_key(t: str) -> str:
 
 def numeric_family(t: str) -> str:
     tn = harmonize_type_variants(t)
+    # Dash-8 special case — treat any DH8/DHC-8 variant as family '8'
+    if tn.upper().startswith(("DH8", "DHC8", "DHC-8")):
+        return "8"
     m = _DIGIT_FAMILY_RX.search(tn)
     return m.group(1) if m else ''
 
 def is_variant_type(t: str) -> bool:
-    x = t.replace("-", "")
+    x = str(t).replace("-", "")
     if re.match(r"^[A-Za-z]+\d+", x):
         return True
     if re.search(r"[A-Za-z]+$", x) and not x.isdigit():
@@ -625,11 +679,50 @@ def is_variant_type(t: str) -> bool:
 
 def type_prefix(t: str) -> str:
     tn = harmonize_type_variants(t)
-    x = re.sub(r'[\s\-]+', '', tn)
+    x = re.sub(r'[\s\-]+', '', str(tn))
     m = re.match(r'^([A-Za-z]+)', x)
     return m.group(1).upper() if m else ''
 
+# --- ICAO override for FIX C (improved) -------------------------------------
+
+ICAO_FAMILY_UNLOCK_CODES: Set[str] = {"DH8A", "DH8B", "DH8C", "DH8D", "D328"}
+
+def is_icao_family_unlock(import_type: str, suggested_type: str, master: Dict) -> bool:
+    """
+    Override activates when:
+      - import type is one of the ICAO unlock codes, OR
+      - suggested type resolves via master ICAO to one of those codes, OR
+      - suggested type matches Dash-8/DHC-8 patterns while import is DH8*/D328.
+    """
+    try:
+        imp = str(harmonize_type_variants(import_type)).upper()
+        sug_norm = str(harmonize_type_variants(suggested_type))
+
+        if imp in ICAO_FAMILY_UNLOCK_CODES:
+            return True
+
+        icao_code = master.get("type_to_icao", {}).get(sug_norm, "")
+        if icao_code:
+            key, _aliases = normalize_code_alias(icao_code)
+            if key.upper() in ICAO_FAMILY_UNLOCK_CODES:
+                return True
+
+        sug_up = sug_norm.upper()
+        if imp.startswith("DH8") and (sug_up.startswith("DHC8") or sug_up.startswith("DHC-8") or "DASH 8" in sug_up):
+            return True
+        if imp == "D328" and ("328" in sug_up or "DORN" in sug_up):
+            return True
+
+    except Exception:
+        pass
+    return False
+
 # --- Processing core ---------------------------------------------------------
+
+GENERIC_ENGINE_CLASSES = {"TURBOPROP", "JET", "PISTON", "TURBOJET", "TURBOFAN"}
+def is_generic_engine(value: str) -> bool:
+    s = normalize_preserve_case(value)
+    return s.upper() in GENERIC_ENGINE_CLASSES
 
 def process_import(
     import_df: pd.DataFrame,
@@ -681,6 +774,15 @@ def process_import(
 
         type_raw_norm = harmonize_type_variants(type_raw)
 
+        # --- ICAO TYPE FALLBACK FOR TYPES LIKE C680 / C25A / C56X / LJ45 ---
+        fallback_icao = ""
+        m = re.match(r"^[A-Z]{1,4}\d{0,3}[A-Z]?$", type_raw_norm.replace("-", ""))
+        if m:
+            fallback_icao = type_raw_norm.upper()
+
+        # Store fallback for ICAO alias expansion
+        fallback_icao_key, fallback_icao_aliases = normalize_code_alias(fallback_icao)
+
         man = row["__man__"]
         typ = row["__type__"]
         eng = row["__engine__"]
@@ -721,15 +823,37 @@ def process_import(
         icao_type_suggestions: List[str] = []
         icao_combo_hits: List[Tuple[float, Tuple[str, str, str], str]] = []
 
+        imp_icao_candidates: Set[str] = set()
+        imp_icao_key, imp_icao_aliases = normalize_code_alias(type_raw_norm)
+        if imp_icao_key:
+            imp_icao_candidates = {imp_icao_key} | imp_icao_aliases
+
         if master["type_icao_col"]:
             code_val = master["type_to_icao"].get(typ, "")
             debug(f"[Row {idx}] ICAO designator for type '{typ}': '{code_val}'")
 
             alias_candidates: Set[str] = set()
+
+            # add Master-derived ICAO if available
             if code_val:
                 code_key, code_aliases = normalize_code_alias(code_val)
-                alias_candidates = {code_key} | code_aliases
+                alias_candidates |= ({code_key} | code_aliases)
 
+            # always add import fallback (C680, C25B, C56X, etc.)
+            if fallback_icao_key:
+                alias_candidates |= ({fallback_icao_key} | fallback_icao_aliases)
+
+            # add import token (e.g., DH8C or C680)
+            alias_candidates |= imp_icao_candidates
+
+            # EXPAND: Dash‑8 crosswalk (optional, keeps DH8X<->DH1/2/3/4 working)
+            DH8_ICAO_TO_IATA = {"DH8A": "DH1", "DH8B": "DH2", "DH8C": "DH3", "DH8D": "DH4"}
+            DH8_IATA_TO_ICAO = {v: k for k, v in DH8_ICAO_TO_IATA.items()}
+            if imp_icao_key in DH8_ICAO_TO_IATA: alias_candidates.add(DH8_ICAO_TO_IATA[imp_icao_key])
+            if imp_icao_key in DH8_IATA_TO_ICAO: alias_candidates.add(DH8_IATA_TO_ICAO[imp_icao_key])
+
+            debug(f"[Row {idx}] Types from ICAO/IATA map: {sorted(set(icao_type_suggestions))[:5]}")
+            
             for a in alias_candidates:
                 icao_type_suggestions.extend(sorted(master["icao_to_types"].get(a, set())))
 
@@ -748,7 +872,15 @@ def process_import(
         family_types = {t for t in master["type_set"] if numeric_family(t) == fam_key}
 
         if prefix_raw:
-            family_types = {t for t in family_types if type_prefix(t) == prefix_raw}
+            # Only enforce prefix when the candidate TYPE itself has a prefix.
+            # Many business-jet master types start with digits (e.g., "680 Citation Sovereign") and would be wrongly filtered out.
+            filtered_by_prefix = {t for t in family_types if type_prefix(t) == prefix_raw}
+            if filtered_by_prefix:
+                family_types = filtered_by_prefix
+            else:
+                # If nothing matches the prefix, skip prefix filtering entirely (numeric-leading descriptive types).
+                debug(
+                    f"[Row {idx}] Skipping prefix filter for family '{fam_key}' because master types are digit-leading.")
 
         if master["type_icao_col"]:
             family_types_with_code = {t for t in family_types if t in master["valid_code_types"]}
@@ -848,7 +980,10 @@ def process_import(
                 suggestion_source = f"base_family_type_preferred(ratio={ratio:.3f})"
             elif icao_combo_hits:
                 score, candidate_combo, candidate_mid = icao_combo_hits[0]
-                if man_eq(candidate_combo[0], man):
+                # accept if manufacturers equal AFTER canonicalization
+                cand_man_canon = canonicalize_manufacturer(candidate_combo[0])
+                imp_man_canon  = canonicalize_manufacturer(man)
+                if man_eq(cand_man_canon, imp_man_canon):
                     sug_combo = candidate_combo
                     sug_mid   = candidate_mid
                     suggestion_source = f"icao_weighted(score={score:.3f})"
@@ -875,19 +1010,24 @@ def process_import(
             else:
                 suggestion_source = "none"
 
-        # ---------- FIX C: HARD NUMERIC FAMILY LOCK ----------
+        # ---------- FIX C: HARD NUMERIC FAMILY LOCK (RELAXED VIA ICAO OVERRIDE) ----------
         if suggestion_source != "none":
             if numeric_family(sug_combo[1]) != numeric_family(type_raw_norm):
-                suggestion_source = "none(family_mismatch)"
-                sug_combo = key
-                sug_mid   = ""
+                if is_icao_family_unlock(type_raw_norm, sug_combo[1], master):
+                    debug(f"[Row {idx}] FIX C relaxed via ICAO unlock for import='{type_raw_norm}' -> suggested='{sug_combo[1]}'")
+                else:
+                    suggestion_source = "none(family_mismatch)"
+                    sug_combo = key
+                    sug_mid   = ""
 
         debug(f"[Row {idx}] → Suggestion source: {suggestion_source}")
         debug(f"[Row {idx}] → Suggested combo (normalized): {sug_combo} | MasterID={sug_mid if sug_mid else '—'}")
 
         # ---------- Engine-aware writeback ----------
         sug_man_norm, sug_typ_norm, sug_eng_norm = sug_combo
-        engine_missing_in_import = (pd.isna(eng_raw) or normalize_preserve_case(eng_raw) == "")
+        engine_missing_in_import = (
+            pd.isna(eng_raw) or normalize_preserve_case(eng_raw) == "" or is_generic_engine(eng_raw)
+        )
 
         if engine_missing_in_import and suggestion_source != "none":
             if not sug_eng_norm or normalize_preserve_case(sug_eng_norm) == "":
@@ -1005,7 +1145,7 @@ def process_import(
         lambda v: (str(v).upper() if pd.notna(v) else v)
     )
 
-    # --- NEW: MTOW digits-only sanitization for SuggestedImport --------------
+    # --- MTOW digits-only sanitization applied ONLY to export ---------------
     mtow_col = try_pick_column(export_suggested, MTOW_COL_CANDIDATES)
     if mtow_col:
         def digits_only(v):
@@ -1096,7 +1236,7 @@ def running_in_cloud() -> bool:
 
 st.title("🛫 SafetyManager365")
 st.subheader("Aircraft Import Validator & Suggester")
-st.caption("Ruben Inion v0.4.8")
+st.caption("Ruben Inion v0.5.3 (DH8x patch)")
 
 with st.sidebar:
     st.header("Settings")
@@ -1176,7 +1316,7 @@ else:
         else:
             master_status_lines.append("No fixed-path OneDrive Master found.")
             if auto_search_master:
-                matches = find_master_candidates_via_auto_search(info, debug, max_depth=max_search_depth, stop_after_first=True)
+                matches = find_master_candidates_via_auto_search(info, debug, max_depth=DEFAULT_MASTER_SEARCH_DEPTH, stop_after_first=True)
                 if matches:
                     try:
                         master_dict = load_master_from_path(matches[0], info, debug)
@@ -1246,15 +1386,9 @@ if run_btn and import_upload is not None:
             m3.metric("Warnings", metrics["warnings"])
             m4.metric("Unable to Import", unable_to_import)
 
-            # Previews
-            st.subheader("Validation preview")
-            st.dataframe(report_df.head(50), use_container_width=True)
-
             # ---------------------- Preview (Modified Suggested Import) ----------------------
-            st.subheader("Import ready preview")
-
+            st.subheader("Import_ready preview (modified MTOW)")
             try:
-                # Reset pointer and load the cleaned SuggestedImport output
                 out_suggested.seek(0)
                 preview_df = pd.read_excel(
                     out_suggested,
@@ -1262,7 +1396,6 @@ if run_btn and import_upload is not None:
                     sheet_name="SuggestedImport"
                 )
                 st.dataframe(preview_df.head(50), use_container_width=True)
-
             except Exception as e:
                 st.warning(f"Unable to render the Import_ready preview: {e}")
 
