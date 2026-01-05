@@ -1387,7 +1387,7 @@ if run_btn and import_upload is not None:
             m4.metric("Unable to Import", unable_to_import)
 
             # ---------------------- Preview (Modified Suggested Import) ----------------------
-            st.subheader("Import_ready preview (modified MTOW)")
+            st.subheader("Import ready preview")
             try:
                 out_suggested.seek(0)
                 preview_df = pd.read_excel(
